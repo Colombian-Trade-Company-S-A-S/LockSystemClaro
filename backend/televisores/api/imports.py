@@ -14,7 +14,7 @@ from django.core.exceptions import ValidationError
 from django.db import transaction
 
 from televisores.cambios import registrar_cambios_masivos, snapshot
-from televisores.validadores import normalizar_serial
+from televisores.validadores import MacInvalida, normalizar_mac, normalizar_serial
 from televisores.models import Televisor
 
 COLUMNAS = ('mac_address', 'serial_number', 'numero_credito')
@@ -101,10 +101,13 @@ def importar_televisores(
         mac = valores.get('mac_address', '').upper()
         if not mac:
             continue  # fila vacía
-        if len(mac) > 50:
+        try:
             # bulk_create aborta el lote entero ante un error de la base de
-            # datos, así que esto se valida aquí y no en el INSERT.
-            errores.append(f'Fila {n} ({mac[:20]}…): la MAC supera los 50 caracteres.')
+            # datos, y full_clean excluye la MAC más abajo: el formato se valida
+            # aquí, fila por fila.
+            mac = normalizar_mac(mac)
+        except MacInvalida as e:
+            errores.append(f'Fila {n} ({mac[:20]}): {e}')
             continue
         if mac not in deseado:
             orden.append(mac)

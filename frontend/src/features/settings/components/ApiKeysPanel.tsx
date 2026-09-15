@@ -57,7 +57,56 @@ function apiErrorMessage(err: unknown, fallback: string): string {
     const first = data.detail ?? data.nombre ?? Object.values(data)[0]
     if (first) return Array.isArray(first) ? String(first[0]) : String(first)
   }
-  return (err as Error)?.message ?? fallback
+  // `||` y no `??`: un 500 sin cuerpo trae el statusText vacío (HTTP/2 no lo
+  // manda), y un mensaje vacío dejaba el diálogo sin ninguna respuesta.
+  return (err as Error)?.message || fallback
+}
+
+// Límites espejo de integracion/api/serializers.py (el backend es el guardia).
+const NOMBRE_MAX = 100
+const IPS_MAX_ENTRADAS = 20
+const IPS_MAX_CARACTERES = 1000
+
+const OCTETO = '(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)'
+const IPV4_RE = new RegExp(`^${OCTETO}(\\.${OCTETO}){3}$`)
+
+function esIpv6(valor: string): boolean {
+  if (!valor.includes(':') || !/^[0-9a-fA-F:.]+$/.test(valor)) return false
+  try {
+    // El parser de URL del navegador valida IPv6 completo (abreviaturas, ::).
+    return Boolean(new URL(`http://[${valor}]/`))
+  } catch {
+    return false
+  }
+}
+
+/** IP o rango CIDR, IPv4 o IPv6 (p. ej. 190.0.0.1 o 192.168.1.0/24). */
+function esIpOCidr(entrada: string): boolean {
+  const partes = entrada.split('/')
+  if (partes.length > 2) return false
+  const [ip, mascara] = partes
+  const maxMascara = IPV4_RE.test(ip) ? 32 : esIpv6(ip) ? 128 : -1
+  if (maxMascara < 0) return false
+  if (mascara === undefined) return true
+  return /^\d{1,3}$/.test(mascara) && Number(mascara) <= maxMascara
+}
+
+/** Mensaje de error de la lista de IPs, o null si es válida. */
+function validarIps(texto: string): string | null {
+  const entradas = texto
+    .split(/[\n,]/)
+    .map((e) => e.trim())
+    .filter(Boolean)
+  if (entradas.length > IPS_MAX_ENTRADAS) return `Máximo ${IPS_MAX_ENTRADAS} IPs o rangos.`
+  const invalida = entradas.find((e) => !esIpOCidr(e))
+  if (!invalida) return null
+  const muestra = invalida.length > 40 ? `${invalida.slice(0, 40)}…` : invalida
+  return `«${muestra}» no es una IP ni un rango CIDR válido (p. ej. 190.0.0.1 o 192.168.1.0/24).`
+}
+
+function FieldError({ msg }: { msg?: string }) {
+  if (!msg) return null
+  return <p className="text-xs text-destructive [overflow-wrap:anywhere]">{msg}</p>
 }
 
 function fmtDate(value: string | null): string {
@@ -99,6 +148,7 @@ function CrearDialog({
   const [ips, setIps] = useState('')
   const [expira, setExpira] = useState('')
   const [error, setError] = useState<string | null>(null)
+  const [campos, setCampos] = useState<Record<string, string>>({})
   const [creada, setCreada] = useState<ApiKeyCreada | null>(null)
   const [copiada, setCopiada] = useState(false)
   const createMut = useCreateApiKey()
@@ -111,6 +161,7 @@ function CrearDialog({
       setIps('')
       setExpira('')
       setError(null)
+      setCampos({})
       setCreada(null)
       setCopiada(false)
     }
@@ -118,11 +169,16 @@ function CrearDialog({
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault()
-    if (!nombre.trim()) {
-      setError('Ponle un nombre para identificar al integrador.')
-      return
-    }
     setError(null)
+    const errores: Record<string, string> = {}
+    if (!nombre.trim()) errores.nombre = 'Ponle un nombre para identificar al integrador.'
+    else if (nombre.trim().length > NOMBRE_MAX)
+      errores.nombre = `El nombre no puede superar ${NOMBRE_MAX} caracteres.`
+    const errorIps = validarIps(ips)
+    if (errorIps) errores.ips_permitidas = errorIps
+    setCampos(errores)
+    if (Object.keys(errores).length) return
+
     try {
       // La mutación invalida la lista por detrás; aquí solo mostramos la clave.
       const key = await createMut.mutateAsync({
@@ -132,7 +188,20 @@ function CrearDialog({
       })
       setCreada(key)
     } catch (err) {
-      setError(apiErrorMessage(err, 'No se pudo crear la API key.'))
+      // Lo que el backend rechaza por campo va debajo de ese campo; cualquier
+      // otra cosa (500, red caída) va arriba, pero SIEMPRE con un mensaje.
+      const data =
+        err instanceof ApiError && err.data && typeof err.data === 'object'
+          ? (err.data as Record<string, unknown>)
+          : null
+      const porCampo: Record<string, string> = {}
+      for (const campo of ['nombre', 'ips_permitidas', 'expira']) {
+        const v = data?.[campo]
+        if (v) porCampo[campo] = Array.isArray(v) ? String(v[0]) : String(v)
+      }
+      setCampos(porCampo)
+      if (!Object.keys(porCampo).length)
+        setError(apiErrorMessage(err, 'No se pudo crear la API key. Intenta de nuevo.'))
     }
   }
 
@@ -160,17 +229,26 @@ function CrearDialog({
               </DialogDescription>
             </DialogHeader>
 
-            <div className="grid gap-2">
-              <Label>Clave de «{creada.nombre}»</Label>
-              <div className="flex items-center gap-2">
-                <code className="min-w-0 flex-1 truncate rounded-lg border bg-muted px-2.5 py-2 font-mono text-xs">
-                  {creada.clave}
-                </code>
-                <Button type="button" variant="outline" size="sm" onClick={copiar}>
-                  <Copy />
-                  {copiada ? 'Copiada' : 'Copiar'}
-                </Button>
-              </div>
+            {/* El nombre y la clave se parten donde haga falta: un nombre largo
+                sin espacios desbordaba la ventana, y la clave recortada con
+                "…" no se podía leer completa (hallazgo EXUS_36). */}
+            <div className="grid min-w-0 gap-2">
+              <p className="text-sm font-medium [overflow-wrap:anywhere]">
+                Clave de «{creada.nombre}»
+              </p>
+              <code className="block rounded-lg border bg-muted px-2.5 py-2 font-mono text-xs break-all select-all">
+                {creada.clave}
+              </code>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="justify-self-end"
+                onClick={copiar}
+              >
+                <Copy />
+                {copiada ? 'Copiada' : 'Copiar'}
+              </Button>
             </div>
 
             <Alert>
@@ -210,12 +288,21 @@ function CrearDialog({
                   id="ak_nombre"
                   value={nombre}
                   onChange={(e) => setNombre(e.target.value)}
+                  maxLength={NOMBRE_MAX}
                   placeholder="ERP de Google"
+                  aria-invalid={!!campos.nombre}
                   autoFocus
                 />
-                <p className="text-xs text-muted-foreground">
-                  Para identificar al integrador.
-                </p>
+                {campos.nombre ? (
+                  <FieldError msg={campos.nombre} />
+                ) : (
+                  <p className="flex justify-between gap-2 text-xs text-muted-foreground">
+                    <span>Para identificar al integrador.</span>
+                    <span className="tabular-nums">
+                      {nombre.length}/{NOMBRE_MAX}
+                    </span>
+                  </p>
+                )}
               </div>
 
               <div className="grid gap-2">
@@ -225,14 +312,21 @@ function CrearDialog({
                   value={ips}
                   onChange={(e) => setIps(e.target.value)}
                   rows={3}
+                  maxLength={IPS_MAX_CARACTERES}
                   placeholder={'190.0.0.1\n192.168.1.0/24'}
+                  aria-invalid={!!campos.ips_permitidas}
                   className={cn(
-                    'w-full rounded-lg border border-input bg-transparent px-2.5 py-1.5 font-mono text-sm outline-none transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30',
+                    'max-h-40 w-full resize-y rounded-lg border border-input bg-transparent px-2.5 py-1.5 font-mono text-sm break-all outline-none transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 aria-invalid:border-destructive aria-invalid:ring-3 aria-invalid:ring-destructive/20 dark:bg-input/30',
                   )}
                 />
-                <p className="text-xs text-muted-foreground">
-                  IPs o rangos CIDR, uno por línea. Vacío = cualquier IP.
-                </p>
+                {campos.ips_permitidas ? (
+                  <FieldError msg={campos.ips_permitidas} />
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    IPs (190.0.0.1) o rangos CIDR (192.168.1.0/24), uno por línea,
+                    máximo {IPS_MAX_ENTRADAS}. Vacío = cualquier IP.
+                  </p>
+                )}
               </div>
 
               <div className="grid gap-2">
@@ -242,11 +336,14 @@ function CrearDialog({
                   type="date"
                   value={expira}
                   onChange={(e) => setExpira(e.target.value)}
+                  aria-invalid={!!campos.expira}
                   className="w-fit"
                 />
-                <p className="text-xs text-muted-foreground">
-                  Vacío = no expira.
-                </p>
+                {campos.expira ? (
+                  <FieldError msg={campos.expira} />
+                ) : (
+                  <p className="text-xs text-muted-foreground">Vacío = no expira.</p>
+                )}
               </div>
             </div>
 
@@ -310,7 +407,7 @@ function ConfirmDialog({
           <DialogTitle>
             {esEliminar ? 'Eliminar API key' : 'Revocar API key'}
           </DialogTitle>
-          <DialogDescription>
+          <DialogDescription className="[overflow-wrap:anywhere]">
             {esEliminar ? (
               <>
                 Se elimina «{target?.key.nombre}» de forma definitiva. Esta acción no
@@ -442,7 +539,11 @@ export function ApiKeysPanel() {
               ) : (
                 keys.map((k) => (
                   <TableRow key={k.id}>
-                    <TableCell className="font-medium">{k.nombre}</TableCell>
+                    <TableCell className="font-medium">
+                      <span className="block max-w-56 truncate" title={k.nombre}>
+                        {k.nombre}
+                      </span>
+                    </TableCell>
                     <TableCell className="font-mono text-xs text-muted-foreground">
                       {k.prefijo}…
                     </TableCell>

@@ -18,6 +18,16 @@ import uuid
 from django.db import models
 
 
+def separar_ips(texto: str) -> list[str]:
+    """Entradas de la lista blanca: una por línea o separadas por coma."""
+    return [
+        e.strip()
+        for linea in (texto or '').splitlines()
+        for e in linea.split(',')
+        if e.strip()
+    ]
+
+
 def _hash_clave(clave: str) -> str:
     """SHA-256 de la clave. Basta porque la clave es un token aleatorio de alta
     entropía (no una contraseña elegida por humanos): no necesita hashing lento.
@@ -111,12 +121,7 @@ class ApiKey(models.Model):
         Sin lista definida, cualquier IP vale (comportamiento documentado). Con
         lista, solo las IPs/rangos indicados. Las entradas mal escritas se
         ignoran (nunca abren el acceso por error)."""
-        entradas = [
-            e.strip()
-            for linea in self.ips_permitidas.splitlines()
-            for e in linea.split(',')
-            if e.strip()
-        ]
+        entradas = separar_ips(self.ips_permitidas)
         if not entradas:
             return True
         if not ip:

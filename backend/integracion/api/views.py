@@ -6,6 +6,9 @@ devuelve una vez, en la respuesta de creación.
 """
 from __future__ import annotations
 
+from datetime import datetime, time
+
+from django.utils import timezone
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -13,7 +16,7 @@ from rest_framework.response import Response
 from integracion.models import ApiKey
 from users.permissions import IsAdminRole
 
-from .serializers import ApiKeyCreadaSerializer, ApiKeySerializer
+from .serializers import ApiKeyCreadaSerializer, ApiKeyCrearSerializer, ApiKeySerializer
 
 
 class ApiKeyViewSet(viewsets.ModelViewSet):
@@ -32,18 +35,17 @@ class ApiKeyViewSet(viewsets.ModelViewSet):
     ordering_fields = ['nombre', 'creada', 'ultimo_uso']
 
     def create(self, request, *args, **kwargs):
-        nombre = str(request.data.get('nombre', '')).strip()
-        if not nombre:
-            return Response(
-                {'nombre': 'Ponle un nombre para identificar al integrador.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        entrada = ApiKeyCrearSerializer(data=request.data)
+        entrada.is_valid(raise_exception=True)
+        datos = entrada.validated_data
         # Endurecimiento opcional: si no se envían, la clave queda sin
         # restricción de IP y sin caducidad (el uso documentado por defecto).
+        # La fecha caduca a las 00:00 de ese día, hora local, como antes.
+        expira = datos.get('expira')
         api_key, clave = ApiKey.generar(
-            nombre=nombre,
-            ips_permitidas=str(request.data.get('ips_permitidas', '')),
-            expira=request.data.get('expira') or None,
+            nombre=datos['nombre'],
+            ips_permitidas=datos['ips_permitidas'],
+            expira=timezone.make_aware(datetime.combine(expira, time.min)) if expira else None,
         )
         # La clave en claro SOLO viaja en esta respuesta; después no se puede
         # recuperar (en la base queda su hash). Si se pierde, se genera otra.

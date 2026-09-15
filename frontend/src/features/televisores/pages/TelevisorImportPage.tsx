@@ -35,7 +35,7 @@ import { cn } from '@/lib/utils'
 
 const COLUMNAS = [
   { columna: 'mac_address', ejemplo: 'B4:04:29:7E:3A:AA', obligatoria: true },
-  { columna: 'serial_number', ejemplo: 'B4:04:29:7E:3A:AA', obligatoria: false },
+  { columna: 'serial_number', ejemplo: 'CLR23275', obligatoria: false },
   { columna: 'numero_credito', ejemplo: '1234567890', obligatoria: false, nota: 'solo dígitos' },
 ]
 

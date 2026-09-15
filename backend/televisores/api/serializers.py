@@ -8,7 +8,12 @@ from televisores.models import (
     SyncJob,
     Televisor,
 )
-from televisores.validadores import SerialInvalido, normalizar_serial
+from televisores.validadores import (
+    MacInvalida,
+    SerialInvalido,
+    normalizar_mac,
+    normalizar_serial,
+)
 
 
 class TelevisorSerializer(serializers.ModelSerializer):
@@ -55,7 +60,10 @@ class TelevisorSerializer(serializers.ModelSerializer):
         return value
 
     def validate_mac_address(self, value: str) -> str:
-        value = value.strip().upper()
+        try:
+            value = normalizar_mac(value)
+        except MacInvalida as e:
+            raise serializers.ValidationError(str(e)) from e
         if not value:
             raise serializers.ValidationError('La dirección MAC es obligatoria.')
         # Unicidad (ignorando el propio registro al editar).

@@ -46,11 +46,11 @@ function parseErrors(err: unknown): {
   return { fields: {}, general: (err as Error)?.message ?? 'Error inesperado.' }
 }
 
-// Número de serie: solo letras y números. Espejo de `televisores/validadores.py`
-// en el backend, que es el guardia real; aquí se filtra al teclear para que el
-// usuario no llegue a escribir un carácter que luego le rechacen.
+// Reglas espejo de `televisores/validadores.py` en el backend, que es el guardia
+// real; aquí se filtra al teclear para que el usuario no llegue a escribir un
+// carácter que luego le rechacen.
 const SERIAL_MIN = 4
-const SERIAL_MAX = 50
+const SERIAL_MAX = 17
 
 /** Quita lo que no sea letra o número y pasa a mayúsculas. */
 function sanitizarSerial(valor: string): string {
@@ -58,6 +58,19 @@ function sanitizarSerial(valor: string): string {
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, '')
     .slice(0, SERIAL_MAX)
+}
+
+// Dirección MAC: seis pares hexadecimales con dos puntos (B4:04:29:7E:3A:AA).
+const MAC_RE = /^[0-9A-F]{2}(:[0-9A-F]{2}){5}$/
+const MAC_LARGO = 17
+const MENSAJE_MAC =
+  'La dirección MAC debe tener el formato XX:XX:XX:XX:XX:XX (por ejemplo B4:04:29:7E:3A:AA).'
+
+/** Deja solo hexadecimales (máx. 12) y pone los dos puntos cada dos. Así una
+ *  MAC pegada con guiones o sin separadores también queda bien. */
+function formatearMac(valor: string): string {
+  const hex = valor.toUpperCase().replace(/[^0-9A-F]/g, '').slice(0, 12)
+  return hex.match(/.{1,2}/g)?.join(':') ?? ''
 }
 
 function FieldError({ msg }: { msg?: string }) {
@@ -105,13 +118,22 @@ export function TelevisorFormPage() {
     setFieldErrors({})
     setGeneral(null)
 
+    // El backend valida lo mismo; esto solo evita el viaje.
+    const errores: Record<string, string> = {}
     // El serial es opcional, pero si se escribe algo tiene que ser un serial
-    // de verdad. El backend valida lo mismo; esto solo evita el viaje.
+    // de verdad.
     const serial = form.serial_number.trim()
     if (serial && serial.length < SERIAL_MIN) {
-      setFieldErrors({
-        serial_number: `El número de serie debe tener al menos ${SERIAL_MIN} caracteres.`,
-      })
+      errores.serial_number = `El número de serie debe tener al menos ${SERIAL_MIN} caracteres.`
+    } else if (serial.length > SERIAL_MAX) {
+      // Solo pasa con un serial viejo cargado al editar: al teclear no se puede.
+      errores.serial_number = `El número de serie no puede superar ${SERIAL_MAX} caracteres.`
+    }
+    const mac = form.mac_address.trim().toUpperCase()
+    if (!mac) errores.mac_address = 'La dirección MAC es obligatoria.'
+    else if (!MAC_RE.test(mac)) errores.mac_address = MENSAJE_MAC
+    if (Object.keys(errores).length) {
+      setFieldErrors(errores)
       return
     }
 
@@ -184,22 +206,6 @@ export function TelevisorFormPage() {
               )}
 
               <div className="grid gap-2">
-                <Label htmlFor="mac">
-                  Dirección MAC <span className="text-destructive">*</span>
-                </Label>
-                <Input
-                  id="mac"
-                  className="font-mono"
-                  value={form.mac_address}
-                  onChange={(e) => set('mac_address', e.target.value)}
-                  placeholder="B4:04:29:7E:3A:ED"
-                  aria-invalid={!!fieldErrors.mac_address}
-                  autoFocus
-                />
-                <FieldError msg={fieldErrors.mac_address} />
-              </div>
-
-              <div className="grid gap-2">
                 <Label htmlFor="serial">Número de serie</Label>
                 <Input
                   id="serial"
@@ -216,13 +222,40 @@ export function TelevisorFormPage() {
                   placeholder="ABC123456789"
                   aria-invalid={!!fieldErrors.serial_number}
                   aria-describedby="serial-ayuda"
+                  autoFocus
                 />
                 {fieldErrors.serial_number ? (
                   <FieldError msg={fieldErrors.serial_number} />
                 ) : (
                   <p id="serial-ayuda" className="text-xs text-muted-foreground">
-                    Solo letras y números, sin espacios ni caracteres
-                    especiales. Opcional.
+                    Solo letras y números, máximo {SERIAL_MAX} caracteres, sin
+                    espacios ni caracteres especiales. Opcional.
+                  </p>
+                )}
+              </div>
+
+              <div className="grid gap-2">
+                <Label htmlFor="mac">
+                  Dirección MAC <span className="text-destructive">*</span>
+                </Label>
+                <Input
+                  id="mac"
+                  className="font-mono"
+                  autoCapitalize="characters"
+                  autoComplete="off"
+                  spellCheck={false}
+                  maxLength={MAC_LARGO}
+                  value={form.mac_address}
+                  onChange={(e) => set('mac_address', formatearMac(e.target.value))}
+                  placeholder="B4:04:29:7E:3A:AA"
+                  aria-invalid={!!fieldErrors.mac_address}
+                  aria-describedby="mac-ayuda"
+                />
+                {fieldErrors.mac_address ? (
+                  <FieldError msg={fieldErrors.mac_address} />
+                ) : (
+                  <p id="mac-ayuda" className="text-xs text-muted-foreground">
+                    Formato XX:XX:XX:XX:XX:XX. Los dos puntos se ponen solos.
                   </p>
                 )}
               </div>

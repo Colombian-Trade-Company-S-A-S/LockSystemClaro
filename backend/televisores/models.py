@@ -2,7 +2,7 @@ from django.conf import settings
 from django.core.validators import RegexValidator
 from django.db import models
 
-from .validadores import validar_serial
+from .validadores import validar_mac, validar_serial
 
 # Un número de crédito: solo dígitos, hasta 60 (se guarda como texto porque
 # 60 dígitos no caben en ningún entero de base de datos).
@@ -19,7 +19,9 @@ class Televisor(models.Model):
     secciones; aquí solo vive el CRUD del dispositivo.
     """
 
-    mac_address = models.CharField('Dirección MAC', max_length=50, unique=True)
+    mac_address = models.CharField(
+        'Dirección MAC', max_length=50, unique=True, validators=[validar_mac]
+    )
     serial_number = models.CharField(
         'Número de serie',
         max_length=50,

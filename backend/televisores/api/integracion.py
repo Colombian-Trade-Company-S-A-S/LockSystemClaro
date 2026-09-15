@@ -19,6 +19,7 @@ from rest_framework.response import Response
 
 from integracion.authentication import ApiKeyAuthentication, ApiKeyRateThrottle
 from televisores.models import Televisor
+from televisores.validadores import SerialInvalido, normalizar_serial
 
 from .serializers import TelevisorSerializer
 from .views import TelevisorViewSet, client_ip, usuario_para_auditoria
@@ -31,10 +32,14 @@ class IntegracionTelevisorSerializer(TelevisorSerializer):
     serial_number = serializers.CharField(required=True, allow_blank=False)
 
     def validate_serial_number(self, value: str) -> str:
-        value = value.strip()
+        # Mismo formato que el panel; aquí solo cambia que es obligatorio.
+        try:
+            value = normalizar_serial(value)
+        except SerialInvalido as e:
+            raise serializers.ValidationError(str(e)) from e
         if not value:
             raise serializers.ValidationError('El serial es obligatorio.')
-        qs = Televisor.objects.filter(serial_number=value)
+        qs = Televisor.objects.filter(serial_number__iexact=value)
         if self.instance:
             qs = qs.exclude(pk=self.instance.pk)
         if qs.exists():
