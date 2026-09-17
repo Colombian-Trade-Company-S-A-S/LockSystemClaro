@@ -91,6 +91,10 @@ export interface UsarPincodeResult {
   passcode: string
   pin_code: string
   creado: string
+  /** Siempre false: usar el pin deja el televisor Habilitado. */
+  inhabilitado: boolean
+  /** SyncJob que aplica la habilitación en el portal (polling con syncStatus). */
+  job: number
 }
 
 // --- Validación (dry-run: portal vs app) ---

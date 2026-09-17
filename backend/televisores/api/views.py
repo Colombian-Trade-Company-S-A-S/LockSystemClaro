@@ -354,8 +354,15 @@ class TelevisorViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='pincodes/usar')
     def pincode_usar(self, request, pk=None):
         """Obtiene el Código Pin para un Código de Acceso, lo marca como usado en
-        el portal y lo registra en la bitácora (aparece en /pincodes)."""
+        el portal y lo registra en la bitácora (aparece en /pincodes).
+
+        Además deja el televisor Habilitado y lanza la sincronización con el
+        portal: el Código Pin desbloquea el equipo, así que la consola y el
+        portal tienen que reflejarlo (hallazgo EXUS_36). Devuelve el id del job
+        para hacer polling, igual que `estado`.
+        """
         from televisores.models import PinCodeUsado
+        from televisores.sync_runner import lanzar_sync_job
 
         tv = self.get_object()
         passcode = str(request.data.get('passcode', '')).strip()
@@ -381,18 +388,31 @@ class TelevisorViewSet(viewsets.ModelViewSet):
         except PortalError as e:
             return Response({'detail': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
 
+        usuario = usuario_para_auditoria(request)
+        ip = client_ip(request)
         registro = PinCodeUsado.objects.create(
             televisor=tv,
             mac_address=tv.mac_address,
             passcode=passcode,
             pin_code=pin_code,
-            usuario=usuario_para_auditoria(request),
-            ip=client_ip(request),
+            usuario=usuario,
+            ip=ip,
         )
+
+        # Se sincroniza aunque la consola ya dijera Habilitado: si el portal
+        # quedó bloqueado (una sync anterior que falló), el televisor se
+        # volvería a bloquear después de desbloquearlo con el pin. Queda en
+        # Sincronizaciones como una habilitación más, con usuario e IP.
+        tv.inhabilitado = False
+        tv.save(update_fields=['inhabilitado'])
+        job = lanzar_sync_job(tv, False, usuario=usuario, ip=ip)
+
         return Response({
             'passcode': passcode,
             'pin_code': pin_code,
             'creado': registro.creado,
+            'inhabilitado': tv.inhabilitado,
+            'job': job.pk,
         })
 
     @action(detail=True, methods=['post'])

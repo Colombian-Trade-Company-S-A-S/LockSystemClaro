@@ -1,5 +1,6 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
+import { useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft,
   Ban,
@@ -20,13 +21,18 @@ import {
 } from 'lucide-react'
 import { televisoresApi } from '@/features/televisores/api/televisores.api'
 import {
+  televisorKeys,
   useDeleteTelevisor,
   useTelevisor,
   useTelevisorRegistros,
 } from '@/features/televisores/api/televisores.queries'
 import { usePermissions } from '@/features/auth/usePermissions'
 import { ApiError } from '@/lib/http/errors'
-import type { PinCodeGroup, ValidarResult } from '@/features/televisores/types'
+import type {
+  PinCodeGroup,
+  Televisor,
+  ValidarResult,
+} from '@/features/televisores/types'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -159,15 +165,61 @@ export function TelevisorDetailPage() {
   const [noEncontrado, setNoEncontrado] = useState(false)
   const [copiado, setCopiado] = useState(false)
 
+  // Sincronización con el portal que dispara el uso del pin.
+  const qc = useQueryClient()
+  const [pinSync, setPinSync] = useState<
+    { fase: 'corriendo' } | { fase: 'ok' } | { fase: 'error'; error: string } | null
+  >(null)
+  const pinPollRef = useRef<number | null>(null)
+  useEffect(
+    () => () => {
+      if (pinPollRef.current) window.clearInterval(pinPollRef.current)
+    },
+    [],
+  )
+
+  function refrescarTelevisor() {
+    qc.invalidateQueries({ queryKey: televisorKeys.lists() })
+    qc.invalidateQueries({ queryKey: televisorKeys.registros(id!) })
+  }
+
+  function seguirSyncPin(jobId: number) {
+    if (pinPollRef.current) window.clearInterval(pinPollRef.current)
+    setPinSync({ fase: 'corriendo' })
+    pinPollRef.current = window.setInterval(async () => {
+      try {
+        const s = await televisoresApi.syncStatus(id!, jobId)
+        if (!s.finalizado) return
+        if (pinPollRef.current) window.clearInterval(pinPollRef.current)
+        setPinSync(
+          s.estado === 'terminado'
+            ? { fase: 'ok' }
+            : { fase: 'error', error: s.error || 'No se pudo aplicar en el portal.' },
+        )
+        refrescarTelevisor()
+      } catch {
+        // Un fallo puntual del polling no corta el seguimiento.
+      }
+    }, 2000)
+  }
+
   async function obtenerPin(e: React.FormEvent) {
     e.preventDefault()
     setPinResult(null)
+    setPinSync(null)
     setNoEncontrado(false)
     setCodigosError(null)
     setObteniendo(true)
     try {
       const r = await televisoresApi.usarPincode(id!, passInput.trim())
       setPinResult({ codeId: '', passCode: r.passcode, pinCode: r.pin_code })
+      // El pin desbloquea el televisor: la consola lo muestra Habilitado ya,
+      // sin esperar a que termine la sincronización con el portal.
+      qc.setQueryData<Televisor>(televisorKeys.detail(id!), (prev) =>
+        prev ? { ...prev, inhabilitado: r.inhabilitado } : prev,
+      )
+      refrescarTelevisor()
+      seguirSyncPin(r.job)
     } catch (err) {
       if (err instanceof ApiError && err.status === 404) setNoEncontrado(true)
       else setCodigosError((err as Error).message)
@@ -443,6 +495,36 @@ export function TelevisorDetailPage() {
                 )}
                 {copiado ? 'Copiado' : 'Copiar'}
               </Button>
+              {pinSync && (
+                <p
+                  className={cn(
+                    'mt-4 flex items-center justify-center gap-2 text-sm [overflow-wrap:anywhere]',
+                    pinSync.fase === 'error'
+                      ? 'text-destructive'
+                      : 'text-muted-foreground',
+                  )}
+                >
+                  {pinSync.fase === 'corriendo' && (
+                    <>
+                      <Loader2 className="size-4 shrink-0 animate-spin" />
+                      El televisor quedó Habilitado. Sincronizando con el portal…
+                    </>
+                  )}
+                  {pinSync.fase === 'ok' && (
+                    <>
+                      <CircleCheck className="size-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                      El televisor quedó Habilitado y sincronizado con el portal.
+                    </>
+                  )}
+                  {pinSync.fase === 'error' && (
+                    <>
+                      <CircleAlert className="size-4 shrink-0" />
+                      El televisor quedó Habilitado, pero no se pudo sincronizar con el
+                      portal: {pinSync.error}
+                    </>
+                  )}
+                </p>
+              )}
             </div>
           )}
         </CardContent>
