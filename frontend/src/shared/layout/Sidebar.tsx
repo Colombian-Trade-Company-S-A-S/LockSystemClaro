@@ -8,6 +8,7 @@ import {
   LogOut,
   Monitor,
   RefreshCw,
+  ScrollText,
   Settings2,
   Users,
 } from 'lucide-react'
@@ -51,6 +52,7 @@ const navItems: NavItem[] = [
   { to: '/historial', label: 'Historial', icon: History },
   { to: '/pincodes', label: 'Códigos Pin', icon: KeyRound },
   { to: '/usuarios', label: 'Usuarios', icon: Users, adminOnly: true },
+  { to: '/auditoria', label: 'Auditoría', icon: ScrollText, adminOnly: true },
 ]
 
 // Logo de marca.

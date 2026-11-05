@@ -14,7 +14,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from televisores.models import BulkSyncItem, BulkSyncJob, PinCodeUsado, SyncJob
 
 from .filtros import filtrar_por_fecha, filtrar_sincronizaciones
-from .registros import nombre_usuario
+from .registros import identificador_sync, nombre_autor, nombre_usuario
 
 XLSX_CONTENT_TYPE = (
     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -30,12 +30,22 @@ def _estilar_encabezado(ws):
         cell.alignment = Alignment(horizontal='center')
 
 
-def _respuesta_xlsx(wb: Workbook, filename: str) -> HttpResponse:
+def _respuesta_xlsx(wb: Workbook, filename: str, *, auditar: bool = True) -> HttpResponse:
+    """Respuesta de descarga del libro. Toda exportación a Excel pasa por aquí
+    (la de CSV, por `reportes_builder._respuesta_csv`, que marca lo mismo).
+
+    Marca la respuesta con las filas de datos que lleva (todas las hojas, sin
+    el encabezado): con eso el middleware de auditoría deja la huella de la
+    descarga (H-07). `auditar=False` solo para lo que no contiene datos, como
+    las plantillas vacías.
+    """
     buffer = io.BytesIO()
     wb.save(buffer)
     buffer.seek(0)
     resp = HttpResponse(buffer.getvalue(), content_type=XLSX_CONTENT_TYPE)
     resp['Content-Disposition'] = f'attachment; filename="{filename}"'
+    if auditar:
+        resp.filas_exportadas = sum(max(ws.max_row - 1, 0) for ws in wb.worksheets)
     return resp
 
 
@@ -82,9 +92,7 @@ def exportar_cambios(queryset, desde=None, hasta=None) -> HttpResponse:
     _estilar_encabezado(ws)
 
     for c in queryset:
-        usuario = '—'
-        if c.usuario_id:
-            usuario = c.usuario.get_full_name() or c.usuario.email
+        usuario = nombre_autor(c)
         ws.append([
             timezone.localtime(c.creado).strftime('%Y-%m-%d %H:%M:%S'),
             c.serial_number or '',
@@ -136,13 +144,18 @@ def exportar_sincronizaciones(
     syncs, items = filtrar_sincronizaciones(syncs, items, desde, hasta)
 
     filas = []
-    # values_list evita instanciar los modelos; la MAC/serial del individual se
-    # sacan por la relación, y el nombre del usuario se arma en SQL.
+    # values_list evita instanciar los modelos; la MAC/serial del individual
+    # salen del televisor (o de la copia de la fila si se borró), y el nombre
+    # del usuario o de la API-key se arma en SQL.
     for creado, serial, mac, usuario, inhabilitar, estado, error in (
-        syncs.annotate(usuario_nombre=nombre_usuario('usuario')).values_list(
+        syncs.annotate(
+            usuario_nombre=nombre_usuario('usuario', api_key='api_key'),
+            serial_v=identificador_sync('serial_number'),
+            mac_v=identificador_sync('mac_address'),
+        ).values_list(
             'creado',
-            'televisor__serial_number',
-            'televisor__mac_address',
+            'serial_v',
+            'mac_v',
             'usuario_nombre',
             'inhabilitar',
             'estado',
@@ -160,7 +173,9 @@ def exportar_sincronizaciones(
             error or '',
         ))
     for creado, serial, mac, usuario, inhabilitar, estado, mensaje in (
-        items.annotate(usuario_nombre=nombre_usuario('job__usuario')).values_list(
+        items.annotate(
+            usuario_nombre=nombre_usuario('job__usuario', api_key='job__api_key')
+        ).values_list(
             'job__creado',
             'televisor__serial_number',
             'mac_address',
@@ -253,7 +268,8 @@ def plantilla_televisores() -> HttpResponse:
     ws.append(['B4:04:29:7E:3A:AA', 'B4:04:29:7E:3A:AA', '1234567890'])
     for col, ancho in zip('ABC', (22, 22, 18)):
         ws.column_dimensions[col].width = ancho
-    return _respuesta_xlsx(wb, 'plantilla_televisores.xlsx')
+    # Plantilla de ejemplo: no saca ningún dato de la app, no deja huella.
+    return _respuesta_xlsx(wb, 'plantilla_televisores.xlsx', auditar=False)
 
 
 def plantilla_estados() -> HttpResponse:
@@ -270,7 +286,7 @@ def plantilla_estados() -> HttpResponse:
     ws.append(['B4:04:29:7E:3A:BB', 'habilitado'])
     for col, ancho in zip('AB', (24, 16)):
         ws.column_dimensions[col].width = ancho
-    return _respuesta_xlsx(wb, 'plantilla_estados.xlsx')
+    return _respuesta_xlsx(wb, 'plantilla_estados.xlsx', auditar=False)
 
 
 def exportar_pincodes(

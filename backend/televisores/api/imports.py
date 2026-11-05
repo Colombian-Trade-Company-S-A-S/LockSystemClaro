@@ -13,7 +13,10 @@ import io
 from django.core.exceptions import ValidationError
 from django.db import transaction
 
-from televisores.cambios import registrar_cambios_masivos, snapshot
+from auditoria.catalogo import Resultado
+from auditoria.contexto import Contexto
+from auditoria.services import construir, diferencias, registrar, registrar_lote
+from televisores.cambios import foto_completa, registrar_cambios_masivos, snapshot
 from televisores.validadores import MacInvalida, normalizar_mac, normalizar_serial
 from televisores.models import Televisor
 
@@ -60,32 +63,42 @@ def leer_filas(nombre: str, data: bytes) -> list[list[str]]:
     return _filas_csv(data)
 
 
-def importar_televisores(
-    nombre: str, data: bytes, *, usuario=None, ip: str | None = None
-) -> dict:
+def importar_televisores(nombre: str, data: bytes, *, contexto: Contexto) -> dict:
     """Crea/actualiza televisores desde el contenido de un archivo.
 
     Una consulta para leer los existentes y dos escrituras por lotes, en vez de
     un get_or_create + save por fila: el coste deja de crecer con el número de
     round-trips a la base de datos.
 
-    `usuario` e `ip` alimentan el historial de cambios: sin ellos las filas se
-    guardan igual, pero sin saber quién las hizo.
+    `contexto` (quién y desde dónde) alimenta el historial de cambios y la
+    bitácora central: un evento por televisor creado o modificado y uno con el
+    resumen de la carga (hallazgo H-04).
 
     Devuelve {'creados', 'actualizados', 'errores': [str, ...]}.
     """
+    def sin_cambios(errores: list[str]) -> dict:
+        # El intento también queda: una carga que no aplicó nada sigue siendo
+        # alguien intentando dar de alta equipos.
+        registrar(
+            'importacion_masiva',
+            contexto=contexto,
+            resultado=Resultado.FALLO,
+            archivo=nombre,
+            creados=0,
+            actualizados=0,
+            errores=len(errores),
+            motivo=errores[0] if len(errores) == 1 else None,
+        )
+        return {'creados': 0, 'actualizados': 0, 'errores': errores}
+
     filas = leer_filas(nombre, data)
 
     if not filas:
-        return {'creados': 0, 'actualizados': 0, 'errores': ['El archivo está vacío.']}
+        return sin_cambios(['El archivo está vacío.'])
 
     mapa = _normalizar_encabezados(filas[0])
     if 'mac_address' not in mapa.values():
-        return {
-            'creados': 0,
-            'actualizados': 0,
-            'errores': ['Falta la columna obligatoria "mac_address".'],
-        }
+        return sin_cambios(['Falta la columna obligatoria "mac_address".'])
 
     campos = set(mapa.values())
     errores: list[str] = []
@@ -114,7 +127,7 @@ def importar_televisores(
         deseado[mac] = {'fila': n, 'valores': valores}
 
     if not orden:
-        return {'creados': 0, 'actualizados': 0, 'errores': errores}
+        return sin_cambios(errores)
 
     existentes = {
         tv.mac_address.upper(): tv
@@ -161,21 +174,51 @@ def importar_televisores(
     campos_editables = [c for c in ('serial_number', 'numero_credito') if c in campos]
 
     with transaction.atomic():
+        eventos = []
         if nuevos:
             Televisor.objects.bulk_create(nuevos, batch_size=LOTE)
+            eventos.extend(
+                construir(
+                    'televisor_creado',
+                    contexto=contexto,
+                    objeto=tv,
+                    despues=foto_completa(tv),
+                    origen='masivo',
+                    archivo=nombre,
+                )
+                for tv in nuevos
+            )
         if actualizar and campos_editables:
             Televisor.objects.bulk_update(actualizar, campos_editables, batch_size=LOTE)
+            pares = [
+                (tv, previos[tv.mac_address.upper()])
+                for tv in actualizar
+                if tv.mac_address.upper() in previos
+            ]
             # Dentro de la transacción: si la escritura de televisores se
             # revierte, el historial no puede quedar afirmando un cambio que no
             # llegó a ocurrir.
-            registrar_cambios_masivos(
-                pares=[
-                    (tv, previos[tv.mac_address.upper()])
-                    for tv in actualizar
-                    if tv.mac_address.upper() in previos
-                ],
-                usuario=usuario,
-                ip=ip,
-            )
+            registrar_cambios_masivos(pares=pares, contexto=contexto)
+            for tv, antes in pares:
+                antes_dif, despues_dif = diferencias(antes, snapshot(tv))
+                if despues_dif:
+                    eventos.append(construir(
+                        'televisor_editado',
+                        contexto=contexto,
+                        objeto=tv,
+                        antes=antes_dif,
+                        despues=despues_dif,
+                        origen='masivo',
+                        archivo=nombre,
+                    ))
+        registrar_lote(eventos)
+        registrar(
+            'importacion_masiva',
+            contexto=contexto,
+            archivo=nombre,
+            creados=len(nuevos),
+            actualizados=len(actualizar),
+            errores=len(errores),
+        )
 
     return {'creados': len(nuevos), 'actualizados': len(actualizar), 'errores': errores}

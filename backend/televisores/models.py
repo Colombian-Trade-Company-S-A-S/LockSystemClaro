@@ -12,6 +12,23 @@ validar_numero_credito = RegexValidator(
 )
 
 
+def api_key_de_auditoria():
+    """Columna «qué API-key lo hizo» de las tablas de operación (hallazgo H-06).
+
+    Sin ella, una acción del integrador quedaba con usuario vacío: tres
+    integradores eran indistinguibles entre sí. PROTECT porque una clave con
+    historial no se borra nunca (se revoca; ver integracion/api/views.py).
+    """
+    return models.ForeignKey(
+        'integracion.ApiKey',
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name='+',
+        verbose_name='API key',
+    )
+
+
 class Televisor(models.Model):
     """Televisor del sistema de bloqueo (Locking System).
 
@@ -154,6 +171,7 @@ class CambioTelevisor(models.Model):
         on_delete=models.SET_NULL,
         related_name='cambios_televisor',
     )
+    api_key = api_key_de_auditoria()
     ip = models.GenericIPAddressField('IP', null=True, blank=True)
     # db_index: es la columna del `ordering` y la del filtro por rango.
     creado = models.DateTimeField('Fecha', auto_now_add=True, db_index=True)
@@ -189,8 +207,24 @@ class SyncJob(models.Model):
         (ERROR, 'Error'),
     ]
 
+    # SET_NULL, no CASCADE (hallazgo H-05): borrar un televisor borraba con él
+    # todo su historial de bloqueos. Ahora la fila sobrevive y se sigue
+    # identificando por la MAC y el serial que guarda ella misma.
     televisor = models.ForeignKey(
-        Televisor, related_name='sync_jobs', on_delete=models.CASCADE
+        Televisor,
+        null=True,
+        blank=True,
+        related_name='sync_jobs',
+        on_delete=models.SET_NULL,
+    )
+    # Copia de los identificadores del televisor al crear el job. `db_default`
+    # además de `default`: mientras dura un despliegue, la versión anterior de
+    # la app sigue insertando jobs sin estas columnas y la base debe aceptarlos.
+    mac_address = models.CharField(
+        'Dirección MAC', max_length=50, blank=True, default='', db_default=''
+    )
+    serial_number = models.CharField(
+        'Número de serie', max_length=50, blank=True, default='', db_default=''
     )
     # Estado objetivo que se aplicará en el portal.
     inhabilitar = models.BooleanField()
@@ -205,6 +239,7 @@ class SyncJob(models.Model):
         on_delete=models.SET_NULL,
         related_name='sync_jobs',
     )
+    api_key = api_key_de_auditoria()
     ip = models.GenericIPAddressField('IP', null=True, blank=True)
     creado = models.DateTimeField(auto_now_add=True, db_index=True)
     actualizado = models.DateTimeField(auto_now=True)
@@ -216,7 +251,7 @@ class SyncJob(models.Model):
         ordering = ['-creado']
 
     def __str__(self):
-        return f'Sync #{self.pk} {self.televisor.mac_address} ({self.estado})'
+        return f'Sync #{self.pk} {self.mac_address or "—"} ({self.estado})'
 
     @property
     def finalizado(self) -> bool:
@@ -265,6 +300,7 @@ class BulkSyncJob(models.Model):
         on_delete=models.SET_NULL,
         related_name='bulk_sync_jobs',
     )
+    api_key = api_key_de_auditoria()
     ip = models.GenericIPAddressField('IP', null=True, blank=True)
     creado = models.DateTimeField(auto_now_add=True, db_index=True)
     actualizado = models.DateTimeField(auto_now=True)
@@ -310,6 +346,7 @@ class PinCodeUsado(models.Model):
         on_delete=models.SET_NULL,
         related_name='pincodes_entregados',
     )
+    api_key = api_key_de_auditoria()
     ip = models.GenericIPAddressField('IP', null=True, blank=True)
     creado = models.DateTimeField('Fecha', auto_now_add=True, db_index=True)
 

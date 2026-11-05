@@ -30,7 +30,10 @@ SECRET_KEY = os.getenv(
 )
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.getenv('DEBUG', 'True') == 'True'
+# Apagado salvo que se pida (hallazgo H-18): un despliegue al que le falte la
+# variable no debe quedar con trazas de error y datos internos a la vista. En
+# local se enciende con DEBUG=True en backend/.env.
+DEBUG = os.getenv('DEBUG', 'False') == 'True'
 
 ALLOWED_HOSTS = [
     h.strip() for h in os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',') if h.strip()
@@ -70,6 +73,7 @@ INSTALLED_APPS = [
     'api',
     'televisores',
     'integracion',  # API-keys + API de integración (por serial)
+    'auditoria',  # Bitácora central de eventos (plan de trazabilidad)
 ]
 
 # Modelo de usuario personalizado (login por email, PK UUID).
@@ -87,6 +91,8 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    # Huella de cada exportación a Excel y de los intentos denegados (H-07).
+    'auditoria.middleware.AuditoriaExportacionesMiddleware',
 ]
 
 ROOT_URLCONF = 'core.urls'
@@ -223,9 +229,23 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 
 # ---------------------------------------------------------------------------
+# Proxies de confianza (IP real del cliente)
+# ---------------------------------------------------------------------------
+# Nº de proxies delante de la app que AÑADEN una entrada a X-Forwarded-For. En
+# Render se asume 1 (su balanceador); está sin confirmar con el proveedor
+# (decisión D-1 del plan de trazabilidad), por eso es variable de entorno: si
+# tras desplegar todas las IP salen iguales, se corrige aquí sin tocar código.
+# Con 0 se ignora la cabecera y se usa la IP de la conexión. Ver common/net.py.
+PROXIES_DE_CONFIANZA = int(os.getenv('PROXIES_DE_CONFIANZA', '1'))
+
+
+# ---------------------------------------------------------------------------
 # Django REST Framework
 # ---------------------------------------------------------------------------
 REST_FRAMEWORK = {
+    # Sin esto DRF usa la cabecera X-Forwarded-For ENTERA como identidad del
+    # throttle: cambiándola en cada intento se esquivaba el límite de login.
+    'NUM_PROXIES': PROXIES_DE_CONFIANZA,
     'DEFAULT_AUTHENTICATION_CLASSES': (
         # JWT con revocación server-side (logout real): ver users/authentication.py
         'users.authentication.RevocationAwareJWTAuthentication',
@@ -543,3 +563,22 @@ LOGGING = {
         'django.security': {'handlers': ['console'], 'level': 'WARNING', 'propagate': False},
     },
 }
+
+# Destino persistente del log (hallazgo H-11). Con LOG_DIR definida, además de
+# la consola se escribe un archivo por día en esa carpeta y se borran los de más
+# de LOG_RETENCION_DIAS días. Ver common/log_archivo.py.
+#
+# OJO en Render: el disco del servicio es efímero. Sin un disco persistente
+# montado en LOG_DIR los archivos se pierden en cada deploy; ahí lo que conserva
+# el log es un Log Stream de Render hacia un servicio externo (se configura en
+# el dashboard, no en el código).
+LOG_DIR = os.getenv('LOG_DIR', '').strip()
+if LOG_DIR:
+    LOGGING['handlers']['archivo'] = {
+        'class': 'common.log_archivo.ArchivoDiarioHandler',
+        'formatter': 'simple',
+        'directorio': LOG_DIR,
+        'retencion_dias': int(os.getenv('LOG_RETENCION_DIAS', '90')),
+    }
+    LOGGING['root']['handlers'].append('archivo')
+    LOGGING['loggers']['django.security']['handlers'].append('archivo')

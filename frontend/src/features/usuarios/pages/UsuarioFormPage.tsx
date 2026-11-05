@@ -33,7 +33,9 @@ const ROLE_HINT: Record<Role, string> = {
   admin: 'Todos los módulos + gestión de usuarios y parametrizaciones.',
   operador:
     'Habilitaciones, inhabilitaciones, enrolamiento/desenrolamiento, pines y reportes.',
-  consulta: 'Solo lectura: validar estado del dispositivo y consultar pines.',
+  // No decir "solo lectura": entregar un Código Pin habilita el televisor.
+  consulta:
+    'Validar estado (individual o masivo), entregar Códigos Pin (habilitan el televisor) y descargar reportes. No edita televisores ni cambia estados.',
 }
 
 /** Extrae errores por campo y un mensaje general de un ApiError de DRF. */

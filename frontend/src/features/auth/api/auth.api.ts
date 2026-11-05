@@ -76,10 +76,16 @@ export const authApi = {
    * Cierra la sesión. Best-effort: pide al backend revocar los tokens del
    * usuario (logout real server-side) y, pase lo que pase, los descarta
    * localmente. No lanza: el cierre local nunca debe fallar por la red.
+   *
+   * `motivo: 'inactividad'` cuando lo decide el navegador y no la persona: la
+   * bitácora lo registra como sesión expirada en vez de cierre voluntario.
    */
-  async logout(): Promise<void> {
+  async logout(motivo?: 'inactividad'): Promise<void> {
     try {
-      await apiFetch<void>(config.endpoints.logout, { method: 'POST' })
+      await apiFetch<void>(config.endpoints.logout, {
+        method: 'POST',
+        body: motivo ? JSON.stringify({ motivo }) : undefined,
+      })
     } catch {
       // El servidor pudo estar caído o el token vencido: da igual, limpiamos.
     } finally {

@@ -7,8 +7,9 @@ Es el mismo TelevisorViewSet del panel, pero:
 
 No se reimplementa nada: se hereda toda la lógica (estados, pines, validación,
 exportes…). El "usuario" de la API-key es sintético (ver
-integracion/authentication.py); por eso las acciones que auditan quién actuó
-guardan usuario vacío + IP (ver `usuario_para_auditoria` en views.py).
+integracion/authentication.py): no es una fila de la base, así que las acciones
+quedan con usuario vacío y la API-key en su propia columna, y en la bitácora a
+nombre de la clave (ver auditoria/contexto.py, hallazgo H-06).
 """
 from __future__ import annotations
 
@@ -17,12 +18,13 @@ from rest_framework.decorators import action
 from rest_framework.parsers import JSONParser
 from rest_framework.response import Response
 
+from auditoria.contexto import Contexto
 from integracion.authentication import ApiKeyAuthentication, ApiKeyRateThrottle
 from televisores.models import Televisor
 from televisores.validadores import SerialInvalido, normalizar_serial
 
 from .serializers import TelevisorSerializer
-from .views import TelevisorViewSet, client_ip, usuario_para_auditoria
+from .views import TelevisorViewSet
 
 
 class IntegracionTelevisorSerializer(TelevisorSerializer):
@@ -102,12 +104,7 @@ class IntegracionTelevisorViewSet(TelevisorViewSet):
             )
 
         job = (
-            lanzar_bulk_job(
-                cambiados,
-                resumen,
-                usuario=usuario_para_auditoria(request),
-                ip=client_ip(request),
-            )
+            lanzar_bulk_job(cambiados, resumen, contexto=Contexto.de_request(request))
             if cambiados
             else None
         )
@@ -156,7 +153,7 @@ class IntegracionTelevisorViewSet(TelevisorViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-        job = lanzar_validacion_masiva(televisores)
+        job = lanzar_validacion_masiva(televisores, contexto=Contexto.de_request(request))
         if job is None:
             return Response(
                 {'detail': 'No hay televisores para validar.'},

@@ -6,10 +6,15 @@ consulta el avance por polling.
 """
 from __future__ import annotations
 
+import logging
 import threading
 
-from django.db import connections
+from django.db import connections, transaction
 from django.utils import timezone
+
+from auditoria.catalogo import Resultado
+from auditoria.contexto import Contexto
+from auditoria.services import construir, registrar, registrar_lote
 
 from .models import BulkSyncItem, BulkSyncJob, Televisor
 from .portal import open_sync
@@ -18,8 +23,40 @@ from .portal.open_client import PortalOpenError
 from .portal.proveedor import sesion_proveedor
 from .portal.selenium_sync import abrir_sesion, aplicar_en_sesion
 
+logger = logging.getLogger(__name__)
 
-def _ejecutar(job_id: int):
+
+def _registrar_fin(job_id: int, contexto: Contexto | None) -> None:
+    """Cierre del lote en la bitácora, a nombre de quien lo lanzó (H-09/H-10).
+
+    Va en el `finally` de cada worker: termine bien, mal o cancelado, el lote
+    queda con su final escrito. Un fallo aquí no puede tumbar el hilo.
+    """
+    try:
+        job = BulkSyncJob.objects.get(pk=job_id)
+        accion = (
+            'validacion_masiva_terminada'
+            if job.modo == BulkSyncJob.VALIDACION
+            else 'lote_terminado'
+        )
+        registrar(
+            accion,
+            contexto=contexto,
+            resultado=(
+                Resultado.FALLO if job.estado == BulkSyncJob.ERROR else Resultado.EXITO
+            ),
+            objeto=job,
+            estado=job.estado,
+            total=job.total,
+            procesados=job.procesados,
+            ok=job.ok_count,
+            errores=job.error_count,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception('No se pudo registrar el fin del lote %s.', job_id)
+
+
+def _ejecutar(job_id: int, contexto: Contexto | None = None):
     driver = None
     try:
         BulkSyncJob.objects.filter(pk=job_id).update(
@@ -91,6 +128,7 @@ def _ejecutar(job_id: int):
                 driver.quit()
             except Exception:  # noqa: BLE001
                 pass
+        _registrar_fin(job_id, contexto)
         connections.close_all()
 
 
@@ -126,7 +164,7 @@ def _respaldo_selenium(televisores) -> dict:
     return resultados
 
 
-def _ejecutar_open(job_id: int):
+def _ejecutar_open(job_id: int, contexto: Contexto | None = None):
     """Igual que `_ejecutar` pero por la Portal API: sin navegador y en lote.
 
     Selenium necesita un login y una visita por televisor; aquí el bloqueo de
@@ -194,10 +232,11 @@ def _ejecutar_open(job_id: int):
             actualizado=timezone.now(),
         )
     finally:
+        _registrar_fin(job_id, contexto)
         connections.close_all()
 
 
-def _ejecutar_validacion(job_id: int):
+def _ejecutar_validacion(job_id: int, contexto: Contexto | None = None):
     """Validación masiva (dry-run): lee el estado del portal por API y lo compara
     con el estado local. No modifica nada."""
     try:
@@ -275,55 +314,96 @@ def _ejecutar_validacion(job_id: int):
         )
         print(f'[validacion] error: {e}')
     finally:
+        _registrar_fin(job_id, contexto)
         connections.close_all()
 
 
-def lanzar_validacion_masiva(televisores=None) -> BulkSyncJob | None:
+def lanzar_validacion_masiva(
+    televisores=None, contexto: Contexto | None = None
+) -> BulkSyncJob | None:
     """Crea un BulkSyncJob de validación y lanza el hilo.
 
     Sin `televisores`, valida TODOS (uso del panel). La API de integración puede
-    pasar un subconjunto ya resuelto (validación por seriales)."""
+    pasar un subconjunto ya resuelto (validación por seriales).
+
+    `contexto` (quién y desde dónde) lo resuelve la vista y viaja hasta el hilo:
+    cuando el worker corre ya no hay request de donde sacarlo (hallazgo H-09)."""
+    ctx = contexto or Contexto.sistema()
     televisores = list(Televisor.objects.all()) if televisores is None else list(televisores)
     if not televisores:
         return None
-    job = BulkSyncJob.objects.create(
-        modo=BulkSyncJob.VALIDACION, total=len(televisores)
-    )
-    BulkSyncItem.objects.bulk_create([
-        BulkSyncItem(
-            job=job,
-            televisor=tv,
-            mac_address=tv.mac_address,
-            inhabilitar=tv.inhabilitado,
+    # El hilo arranca DESPUÉS del commit: si arrancara dentro de la
+    # transacción, podría buscar el job antes de que exista para él.
+    with transaction.atomic():
+        job = BulkSyncJob.objects.create(
+            modo=BulkSyncJob.VALIDACION,
+            total=len(televisores),
+            usuario_id=ctx.usuario_id,
+            api_key_id=ctx.api_key_id,
+            ip=ctx.ip,
         )
-        for tv in televisores
-    ])
-    threading.Thread(target=_ejecutar_validacion, args=(job.pk,), daemon=True).start()
+        BulkSyncItem.objects.bulk_create([
+            BulkSyncItem(
+                job=job,
+                televisor=tv,
+                mac_address=tv.mac_address,
+                inhabilitar=tv.inhabilitado,
+            )
+            for tv in televisores
+        ])
+        registrar('validacion_masiva_iniciada', contexto=ctx, objeto=job, total=job.total)
+    threading.Thread(target=_ejecutar_validacion, args=(job.pk, ctx), daemon=True).start()
     return job
 
 
 def lanzar_bulk_job(
-    cambiados: list[Televisor], resumen: dict, usuario=None, ip: str | None = None
+    cambiados: list[Televisor], resumen: dict, contexto: Contexto | None = None
 ) -> BulkSyncJob:
-    """Crea el BulkSyncJob + items para los TV cambiados y lanza el hilo."""
-    job = BulkSyncJob.objects.create(
-        total=len(cambiados),
-        creados=resumen.get('creados', 0),
-        actualizados=resumen.get('actualizados', 0),
-        errores_import=resumen.get('errores', []),
-        usuario=usuario if usuario and usuario.is_authenticated else None,
-        ip=ip,
-    )
-    BulkSyncItem.objects.bulk_create([
-        BulkSyncItem(
-            job=job,
-            televisor=tv,
-            mac_address=tv.mac_address,
-            inhabilitar=tv.inhabilitado,
+    """Crea el BulkSyncJob + items para los TV cambiados y lanza el hilo.
+
+    Además del evento del lote, deja un `estado_solicitado` por televisor: así
+    «todo lo que pasó con este televisor» incluye los cambios de estado que le
+    llegaron por un archivo, no solo los del botón.
+    """
+    ctx = contexto or Contexto.sistema()
+    with transaction.atomic():
+        job = BulkSyncJob.objects.create(
+            total=len(cambiados),
+            creados=resumen.get('creados', 0),
+            actualizados=resumen.get('actualizados', 0),
+            errores_import=resumen.get('errores', []),
+            usuario_id=ctx.usuario_id,
+            api_key_id=ctx.api_key_id,
+            ip=ctx.ip,
         )
-        for tv in cambiados
-    ])
+        BulkSyncItem.objects.bulk_create([
+            BulkSyncItem(
+                job=job,
+                televisor=tv,
+                mac_address=tv.mac_address,
+                inhabilitar=tv.inhabilitado,
+            )
+            for tv in cambiados
+        ])
+        registrar(
+            'lote_iniciado',
+            contexto=ctx,
+            objeto=job,
+            total=job.total,
+            errores_archivo=len(job.errores_import) or None,
+        )
+        registrar_lote(
+            construir(
+                'estado_solicitado',
+                contexto=ctx,
+                objeto=tv,
+                operacion='Inhabilitar' if tv.inhabilitado else 'Habilitar',
+                origen='masivo',
+                lote=job.pk,
+            )
+            for tv in cambiados
+        )
     runner = _ejecutar_open if open_sync.usa_open() else _ejecutar
-    hilo = threading.Thread(target=runner, args=(job.pk,), daemon=True)
+    hilo = threading.Thread(target=runner, args=(job.pk, ctx), daemon=True)
     hilo.start()
     return job

@@ -2,7 +2,7 @@
 Sincronizaciones y Pincodes usados (10 registros por página)."""
 from __future__ import annotations
 
-from django.db.models import CharField, F, Value
+from django.db.models import Case, CharField, F, Value, When
 from django.db.models.functions import Coalesce, Concat, NullIf, Trim
 from rest_framework.generics import ListAPIView
 from rest_framework.pagination import PageNumberPagination
@@ -28,12 +28,17 @@ def _resultado_item(estado: str) -> str:
     return {'ok': 'Aplicado', 'error': 'Error'}.get(estado, 'Pendiente')
 
 
-def nombre_usuario(prefix: str):
-    """Expresión SQL con el nombre completo del usuario que lanzó la acción.
+PREFIJO_API_KEY = 'API key: '
+
+
+def nombre_usuario(prefix: str, api_key: str | None = None):
+    """Expresión SQL con el nombre de quien lanzó la acción.
 
     `prefix` es la ruta a la relación de usuario ('usuario' o 'job__usuario').
-    Arma 'Nombres Apellidos'; si ambos están vacíos cae al email, y si no hay
-    usuario (SET_NULL) queda '—'.
+    Arma 'Nombres Apellidos'; si ambos están vacíos cae al email. Con `api_key`
+    (ruta a la relación de la clave), una acción hecha por un integrador sale
+    como 'API key: <nombre>' en vez de anónima (hallazgo H-06). Si no hay
+    ninguno de los dos queda '—'.
     """
     completo = Trim(
         Concat(
@@ -43,10 +48,39 @@ def nombre_usuario(prefix: str):
             output_field=CharField(),
         )
     )
+    opciones = [NullIf(completo, Value('')), f'{prefix}__email']
+    if api_key:
+        opciones.append(
+            Case(
+                When(
+                    **{f'{api_key}__isnull': False},
+                    then=Concat(
+                        Value(PREFIJO_API_KEY), f'{api_key}__nombre', output_field=CharField()
+                    ),
+                ),
+                default=None,
+                output_field=CharField(),
+            )
+        )
+    return Coalesce(*opciones, Value('—'), output_field=CharField())
+
+
+def nombre_autor(obj) -> str:
+    """Lo mismo que `nombre_usuario`, en Python, para una fila ya cargada
+    (CambioTelevisor, SyncJob, BulkSyncJob, PinCodeUsado)."""
+    if obj.usuario_id:
+        return obj.usuario.get_full_name() or obj.usuario.email
+    if getattr(obj, 'api_key_id', None):
+        return f'{PREFIJO_API_KEY}{obj.api_key.nombre}'
+    return '—'
+
+
+def identificador_sync(campo: str):
+    """MAC o serial de un SyncJob: el del televisor si sigue existiendo (así una
+    MAC corregida después se ve corregida), y si se borró, la copia que guardó
+    la propia fila al crearse (hallazgo H-05)."""
     return Coalesce(
-        NullIf(completo, Value('')),
-        f'{prefix}__email',
-        Value('—'),
+        f'televisor__{campo}', NullIf(F(campo), Value('')), Value('—'),
         output_field=CharField(),
     )
 
@@ -69,10 +103,10 @@ def qs_sincronizaciones(televisor=None, desde=None, hasta=None):
 
     individuales = syncs.annotate(
         fecha=F('creado'),
-        # El televisor es SET_NULL: puede haberse borrado y dejar la fila huérfana.
-        mac=Coalesce('televisor__mac_address', Value('—')),
-        serial=Coalesce('televisor__serial_number', Value('—')),
-        usuario_nombre=nombre_usuario('usuario'),
+        # El televisor es SET_NULL: si se borró, la fila conserva su copia.
+        mac=identificador_sync('mac_address'),
+        serial=identificador_sync('serial_number'),
+        usuario_nombre=nombre_usuario('usuario', api_key='api_key'),
         tipo=Value('Individual', output_field=CharField()),
     ).values(
         'fecha', 'mac', 'serial', 'usuario_nombre', 'inhabilitar', 'estado', 'tipo', 'id'
@@ -83,7 +117,7 @@ def qs_sincronizaciones(televisor=None, desde=None, hasta=None):
         fecha=F('job__creado'),
         mac=F('mac_address'),
         serial=Coalesce('televisor__serial_number', Value('—')),
-        usuario_nombre=nombre_usuario('job__usuario'),
+        usuario_nombre=nombre_usuario('job__usuario', api_key='job__api_key'),
         tipo=Value('Masivo', output_field=CharField()),
     ).values(
         'fecha', 'mac', 'serial', 'usuario_nombre', 'inhabilitar', 'estado', 'tipo', 'id'
@@ -97,7 +131,13 @@ def qs_sincronizaciones(televisor=None, desde=None, hasta=None):
     # comparten la fecha del lote, y ORDER BY solo por fecha deja el orden de
     # los empates a criterio de Postgres. Con LIMIT/OFFSET eso hace que al
     # pasar de página se repitan o se pierdan filas.
-    return individuales.union(masivos, all=True).order_by('-fecha', 'tipo', '-id')
+    #
+    # `order_by()` vacío en cada rama: el orden por defecto de los modelos no
+    # sirve dentro de un UNION (manda el de fuera), y SQLite directamente lo
+    # rechaza, lo que dejaba esta pantalla rota en local.
+    return individuales.order_by().union(masivos.order_by(), all=True).order_by(
+        '-fecha', 'tipo', '-id'
+    )
 
 
 def _fila(r: dict) -> dict:
@@ -149,8 +189,9 @@ def qs_cambios(request):
     que garantiza que el archivo traiga exactamente lo que se ve en pantalla.
     """
     return filtrar_cambios(
-        # select_related: la tabla muestra el nombre del usuario en cada fila.
-        CambioTelevisor.objects.select_related('usuario'),
+        # select_related: la tabla muestra el nombre del usuario (o de la API
+        # key) en cada fila.
+        CambioTelevisor.objects.select_related('usuario', 'api_key'),
         desde=request.query_params.get('desde'),
         hasta=request.query_params.get('hasta'),
         buscar=request.query_params.get('buscar'),

@@ -9,6 +9,9 @@ Solo cubre datos identificatorios: MAC, serial y número de crédito. El estado
 """
 from __future__ import annotations
 
+from auditoria.contexto import Contexto
+from auditoria.services import foto
+
 from .models import CambioTelevisor, Televisor
 
 # Campos auditados, en el orden en que se muestran.
@@ -18,10 +21,26 @@ CAMPOS_AUDITADOS = (
     CambioTelevisor.CREDITO,
 )
 
+# Todo lo que define a un televisor. Es lo que la bitácora central guarda en un
+# alta o una baja: en la baja, es la única forma de saber después qué se perdió.
+CAMPOS_FOTO = (
+    'mac_address',
+    'serial_number',
+    'numero_credito',
+    'eui64',
+    'inhabilitado',
+    'created_at',
+)
+
 
 def snapshot(televisor: Televisor) -> dict[str, str]:
     """Valores actuales de los campos auditados. Tomar ANTES de modificar."""
     return {campo: (getattr(televisor, campo, '') or '') for campo in CAMPOS_AUDITADOS}
+
+
+def foto_completa(televisor: Televisor) -> dict:
+    """Estado completo del televisor para la bitácora central."""
+    return foto(televisor, CAMPOS_FOTO)
 
 
 def _diferencias(antes: dict[str, str], televisor: Televisor) -> list[tuple[str, str, str]]:
@@ -41,7 +60,7 @@ def _diferencias(antes: dict[str, str], televisor: Televisor) -> list[tuple[str,
 
 
 def _fila(televisor: Televisor, campo: str, anterior: str, nuevo: str,
-          *, usuario, ip, origen) -> CambioTelevisor:
+          *, contexto: Contexto, origen) -> CambioTelevisor:
     return CambioTelevisor(
         televisor=televisor,
         # Identificadores ya actualizados: es como se busca el televisor hoy.
@@ -52,10 +71,12 @@ def _fila(televisor: Televisor, campo: str, anterior: str, nuevo: str,
         valor_anterior=anterior[:120],
         valor_nuevo=nuevo[:120],
         origen=origen,
-        # `usuario` puede venir anónimo (API de integración por api-key), y el
-        # campo es nulable: la fila se guarda igual, sin persona asociada.
-        usuario=usuario if getattr(usuario, 'is_authenticated', False) else None,
-        ip=ip,
+        # Por ids y no por objetos: el "usuario" de una API-key no es una fila
+        # de la base y no puede ir en la FK de usuario. Esa acción queda con la
+        # API-key en su propia columna (H-06).
+        usuario_id=contexto.usuario_id,
+        api_key_id=contexto.api_key_id,
+        ip=contexto.ip,
     )
 
 
@@ -63,13 +84,12 @@ def registrar_cambios(
     *,
     televisor: Televisor,
     antes: dict[str, str],
-    usuario=None,
-    ip: str | None = None,
+    contexto: Contexto,
     origen: str = CambioTelevisor.INDIVIDUAL,
 ) -> list[CambioTelevisor]:
     """Guarda una fila por cada campo que cambió. Devuelve las filas creadas."""
     filas = [
-        _fila(televisor, campo, anterior, nuevo, usuario=usuario, ip=ip, origen=origen)
+        _fila(televisor, campo, anterior, nuevo, contexto=contexto, origen=origen)
         for campo, anterior, nuevo in _diferencias(antes, televisor)
     ]
     if filas:
@@ -80,8 +100,7 @@ def registrar_cambios(
 def registrar_cambios_masivos(
     *,
     pares: list[tuple[Televisor, dict[str, str]]],
-    usuario=None,
-    ip: str | None = None,
+    contexto: Contexto,
 ) -> int:
     """Versión por lotes: recibe (televisor_ya_modificado, valores_previos).
 
@@ -94,7 +113,7 @@ def registrar_cambios_masivos(
         filas.extend(
             _fila(
                 televisor, campo, anterior, nuevo,
-                usuario=usuario, ip=ip, origen=CambioTelevisor.MASIVO,
+                contexto=contexto, origen=CambioTelevisor.MASIVO,
             )
             for campo, anterior, nuevo in _diferencias(antes, televisor)
         )

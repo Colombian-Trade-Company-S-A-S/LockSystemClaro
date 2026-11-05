@@ -7,7 +7,6 @@ import {
   Loader2,
   Plus,
   ShieldAlert,
-  Trash2,
 } from 'lucide-react'
 // Guía de integración: se importa como asset para que Vite genere la URL con
 // hash y respete el `base` de despliegue (así la descarga no falla en la web).
@@ -16,7 +15,6 @@ import { type ApiKey, type ApiKeyCreada } from '@/features/settings/api/apiKeys.
 import {
   useApiKeys,
   useCreateApiKey,
-  useEliminarApiKey,
   useRevocarApiKey,
 } from '@/features/settings/api/apiKeys.queries'
 import { ApiError } from '@/lib/http/errors'
@@ -368,20 +366,20 @@ function CrearDialog({
 }
 
 // ---------------------------------------------------------------------------
-// Diálogo de confirmación (revocar / eliminar)
+// Diálogo de confirmación de la revocación
 // ---------------------------------------------------------------------------
+// No hay "Eliminar": borrar una clave borraba también la constancia de que
+// existió y de lo que hizo. Revocar es la única forma de retirarla.
 function ConfirmDialog({
   target,
   onOpenChange,
 }: {
-  target: { key: ApiKey; accion: 'revocar' | 'eliminar' } | null
+  target: ApiKey | null
   onOpenChange: (v: boolean) => void
 }) {
   const [error, setError] = useState<string | null>(null)
-  const esEliminar = target?.accion === 'eliminar'
   const revocarMut = useRevocarApiKey()
-  const eliminarMut = useEliminarApiKey()
-  const working = revocarMut.isPending || eliminarMut.isPending
+  const working = revocarMut.isPending
 
   useEffect(() => {
     if (target) setError(null)
@@ -391,9 +389,8 @@ function ConfirmDialog({
     if (!target) return
     setError(null)
     try {
-      // Cada mutación invalida la lista; no hay que refrescar a mano.
-      if (esEliminar) await eliminarMut.mutateAsync(target.key.id)
-      else await revocarMut.mutateAsync(target.key.id)
+      // La mutación invalida la lista; no hay que refrescar a mano.
+      await revocarMut.mutateAsync(target.id)
       onOpenChange(false)
     } catch (err) {
       setError(apiErrorMessage(err, 'No se pudo completar la acción.'))
@@ -404,21 +401,10 @@ function ConfirmDialog({
     <Dialog open={target !== null} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>
-            {esEliminar ? 'Eliminar API key' : 'Revocar API key'}
-          </DialogTitle>
+          <DialogTitle>Revocar API key</DialogTitle>
           <DialogDescription className="[overflow-wrap:anywhere]">
-            {esEliminar ? (
-              <>
-                Se elimina «{target?.key.nombre}» de forma definitiva. Esta acción no
-                se puede deshacer.
-              </>
-            ) : (
-              <>
-                «{target?.key.nombre}» dejará de funcionar de inmediato. El registro
-                queda como bitácora (no se borra).
-              </>
-            )}
+            «{target?.nombre}» dejará de funcionar de inmediato. El registro queda
+            como bitácora (no se borra).
           </DialogDescription>
         </DialogHeader>
 
@@ -433,14 +419,9 @@ function ConfirmDialog({
           <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
             Cancelar
           </Button>
-          <Button
-            type="button"
-            variant={esEliminar ? 'destructive' : 'default'}
-            onClick={confirmar}
-            disabled={working}
-          >
+          <Button type="button" onClick={confirmar} disabled={working}>
             {working && <Loader2 className="animate-spin" />}
-            {esEliminar ? 'Eliminar' : 'Revocar'}
+            Revocar
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -453,9 +434,7 @@ function ConfirmDialog({
 // ---------------------------------------------------------------------------
 export function ApiKeysPanel() {
   const [crearAbierto, setCrearAbierto] = useState(false)
-  const [confirm, setConfirm] = useState<
-    { key: ApiKey; accion: 'revocar' | 'eliminar' } | null
-  >(null)
+  const [confirm, setConfirm] = useState<ApiKey | null>(null)
 
   const listQuery = useApiKeys()
   const keys = listQuery.data ?? []
@@ -558,23 +537,17 @@ export function ApiKeysPanel() {
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-2">
-                        {k.activa && (
+                        {k.activa ? (
                           <Button
                             variant="outline"
                             size="sm"
-                            onClick={() => setConfirm({ key: k, accion: 'revocar' })}
+                            onClick={() => setConfirm(k)}
                           >
                             Revocar
                           </Button>
+                        ) : (
+                          <span className="text-muted-foreground">—</span>
                         )}
-                        <Button
-                          variant="ghost"
-                          size="icon-sm"
-                          aria-label="Eliminar"
-                          onClick={() => setConfirm({ key: k, accion: 'eliminar' })}
-                        >
-                          <Trash2 className="text-destructive" />
-                        </Button>
                       </div>
                     </TableCell>
                   </TableRow>

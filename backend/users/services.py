@@ -11,16 +11,32 @@ import logging
 
 from django.db import IntegrityError, transaction
 
+from auditoria.contexto import Contexto
+from auditoria.services import foto, registrar
+
 from .emails import enviar_recuperacion_password
 from .models import (
     PasswordResetToken,
     Role,
     SesionActiva,
     User,
+    describir_user_agent,
     identidad_navegador,
 )
 
 logger = logging.getLogger(__name__)
+
+# Lo que define a una cuenta y sus permisos, para la bitácora. Nunca la
+# contraseña ni su hash.
+CAMPOS_USUARIO = (
+    'email',
+    'first_name',
+    'last_name',
+    'role',
+    'is_active',
+    'is_staff',
+    'is_superuser',
+)
 
 
 @transaction.atomic
@@ -33,8 +49,13 @@ def user_create(
     role: str = Role.CONSULTA,
     is_active: bool = True,
     is_staff: bool = False,
+    contexto: Contexto | None = None,
 ) -> User:
-    """Crea un usuario estándar aplicando las validaciones del modelo."""
+    """Crea un usuario estándar aplicando las validaciones del modelo.
+
+    Deja el alta en la bitácora (hallazgo H-03) con el rol con el que nace: es
+    el primer eslabón de «quién le dio permiso».
+    """
     user = User(
         email=email,
         first_name=first_name,
@@ -46,6 +67,12 @@ def user_create(
     user.full_clean(exclude=['password'])
     user.set_password(password)
     user.save()
+    registrar(
+        'usuario_creado',
+        contexto=contexto,
+        objeto=user,
+        despues=foto(user, CAMPOS_USUARIO),
+    )
     return user
 
 
@@ -58,19 +85,28 @@ def user_set_password(*, user: User, raw_password: str) -> User:
 
 
 @transaction.atomic
-def user_update(*, user: User, data: dict) -> User:
-    """Actualiza campos permitidos de un usuario existente."""
+def user_update(*, user: User, data: dict, contexto: Contexto | None = None) -> User:
+    """Actualiza campos permitidos de un usuario existente.
+
+    La lista de campos cambiados, que ya se armaba para guardar solo lo
+    necesario, ahora además va a la bitácora (hallazgo H-03). El cambio de rol
+    y el de activación van como eventos propios: son los que responden «quién
+    le dio permiso» y «quién le quitó el acceso».
+    """
     updatable_fields = {'first_name', 'last_name', 'role', 'is_active', 'accent'}
     changed = []
+    antes = {}
 
     for field, value in data.items():
         if field in updatable_fields and getattr(user, field) != value:
+            antes[field] = getattr(user, field)
             setattr(user, field, value)
             changed.append(field)
 
     if changed:
         user.full_clean(exclude=['password'])
         user.save(update_fields=[*changed, 'updated_at'])
+        registrar_cambios_usuario(user, antes, contexto or Contexto.sistema())
 
     # Desactivar una cuenta debe echar fuera a quien la esté usando ahora mismo,
     # no solo impedir el próximo inicio de sesión.
@@ -79,6 +115,51 @@ def user_update(*, user: User, data: dict) -> User:
         sesion_cerrar(user)
 
     return user
+
+
+def registrar_cambios_usuario(user: User, antes: dict, contexto: Contexto) -> None:
+    """Un evento por tipo de cambio, a partir de los valores previos de los
+    campos que cambiaron. Lo usan la API y el admin de Django.
+
+    El color de acento es una preferencia de pantalla: no es un cambio que
+    nadie necesite auditar.
+    """
+    if 'role' in antes:
+        registrar(
+            'rol_cambiado',
+            contexto=contexto,
+            objeto=user,
+            antes={'role': antes['role']},
+            despues={'role': user.role},
+        )
+    if 'is_active' in antes:
+        registrar(
+            'usuario_activado' if user.is_active else 'usuario_desactivado',
+            contexto=contexto,
+            objeto=user,
+            antes={'is_active': antes['is_active']},
+            despues={'is_active': user.is_active},
+        )
+    # Solo se pueden tocar desde el admin de Django; la API no los expone.
+    admin = [c for c in ('is_staff', 'is_superuser') if c in antes]
+    if admin:
+        registrar(
+            'permisos_admin_cambiados',
+            contexto=contexto,
+            objeto=user,
+            antes={c: antes[c] for c in admin},
+            despues={c: getattr(user, c) for c in admin},
+        )
+    datos = [c for c in ('email', 'first_name', 'last_name') if c in antes]
+    if datos:
+        propio = contexto.usuario_id is not None and str(contexto.usuario_id) == str(user.pk)
+        registrar(
+            'perfil_actualizado' if propio else 'usuario_actualizado',
+            contexto=contexto,
+            objeto=user,
+            antes={c: antes[c] for c in datos},
+            despues={c: getattr(user, c) for c in datos},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +188,30 @@ class NavegadorEnUso(Exception):
         super().__init__('Este navegador ya tiene una sesión abierta.')
 
 
+def _expirar(sesion: SesionActiva) -> None:
+    """Borra una sesión caducada y deja constancia de que expiró (H-02).
+
+    La caducidad se detecta tarde, cuando alguien vuelve a preguntar por la
+    sesión, así que el momento del evento es el de la detección; la hora real
+    del corte es `ultima_actividad` + la ventana de inactividad, y va en el
+    detalle. Solo registra quien efectivamente la borró: si dos peticiones la
+    detectan a la vez, queda un evento, no dos.
+    """
+    borradas, _ = SesionActiva.objects.filter(pk=sesion.pk).delete()
+    if not borradas:
+        return
+    registrar(
+        'sesion_expirada',
+        objeto=sesion.user,
+        detectada_por='servidor',
+        sesion=str(sesion.pk),
+        ip_sesion=sesion.ip,
+        dispositivo=describir_user_agent(sesion.user_agent),
+        iniciada=sesion.creada,
+        ultima_actividad=sesion.ultima_actividad,
+    )
+
+
 def sesion_vigente(user: User) -> SesionActiva | None:
     """Sesión abierta del usuario, o None si no tiene o si ya caducó.
 
@@ -118,7 +223,7 @@ def sesion_vigente(user: User) -> SesionActiva | None:
     if sesion is None:
         return None
     if sesion.vencida:
-        sesion.delete()
+        _expirar(sesion)
         return None
     return sesion
 
@@ -138,7 +243,7 @@ def sesion_de_navegador(navegador_id: str | None) -> SesionActiva | None:
     if sesion is None:
         return None
     if sesion.vencida:
-        sesion.delete()
+        _expirar(sesion)
         return None
     return sesion
 
@@ -209,18 +314,21 @@ def sesion_cerrar(user: User) -> None:
 # ---------------------------------------------------------------------------
 # Recuperación de contraseña (enlace de un solo uso enviado por correo)
 # ---------------------------------------------------------------------------
-def password_reset_solicitar(*, email: str, ip: str | None = None) -> None:
+def password_reset_solicitar(*, email: str, ip: str | None = None) -> User | None:
     """Emite un enlace de recuperación y lo envía por correo.
 
     **No revela si la cuenta existe.** Si el correo no corresponde a ninguna
     cuenta activa la función no hace nada y la vista responde igual que en el
     caso normal: de lo contrario el formulario sería un oráculo para averiguar
     qué correos están registrados.
+
+    Devuelve la cuenta (o None) solo para que la vista lo anote en la bitácora;
+    nunca para responder distinto.
     """
     user = User.objects.filter(email__iexact=email.strip(), is_active=True).first()
     if user is None:
         logger.info('Recuperación solicitada para un correo sin cuenta activa.')
-        return
+        return None
 
     # El envío queda FUERA de la transacción del token: si el correo falla, no
     # queremos dejar en la base un token emitido que nadie recibió.
@@ -228,6 +336,7 @@ def password_reset_solicitar(*, email: str, ip: str | None = None) -> None:
         _, token = PasswordResetToken.emitir(user=user, ip=ip)
 
     enviar_recuperacion_password(user=user, token=token)
+    return user
 
 
 def password_reset_buscar(token: str) -> PasswordResetToken | None:

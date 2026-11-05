@@ -12,6 +12,7 @@ from openpyxl import Workbook
 from televisores.models import BulkSyncJob
 
 from .exports import _estilar_encabezado, _respuesta_xlsx
+from .registros import PREFIJO_API_KEY
 from .reportes import (
     Filtros,
     acciones,
@@ -34,6 +35,26 @@ def _fmt(dt) -> str:
     if not dt:
         return ''
     return timezone.localtime(dt).strftime('%d/%m/%Y %H:%M')
+
+
+def _autor(obj) -> str:
+    """Correo de quien lanzó la acción, o la API-key si fue un integrador
+    (hallazgo H-06). Vacío si no hay ninguno."""
+    if obj.usuario_id:
+        return obj.usuario.email
+    if obj.api_key_id:
+        return f'{PREFIJO_API_KEY}{obj.api_key.nombre}'
+    return ''
+
+
+def _serial_sync(job) -> str:
+    """Serial de un SyncJob: el del televisor, o la copia de la fila si el
+    televisor se borró (hallazgo H-05)."""
+    return job.televisor.serial_number if job.televisor else job.serial_number
+
+
+def _mac_sync(job) -> str:
+    return job.televisor.mac_address if job.televisor else (job.mac_address or '—')
 
 
 def _anchos(ws, medidas: dict[str, int]) -> None:
@@ -176,12 +197,12 @@ def exportar_historico_serial(f: Filtros | None = None):
     for j in syncs:
         filas.append((
             j.creado,
-            j.televisor.serial_number if j.televisor else '',
-            j.televisor.mac_address if j.televisor else '—',
+            _serial_sync(j),
+            _mac_sync(j),
             'Inhabilitar' if j.inhabilitar else 'Habilitar',
             {'terminado': 'Efectiva', 'error': 'Error'}.get(j.estado, 'En proceso'),
             'Individual',
-            j.usuario.email if j.usuario else '',
+            _autor(j),
             j.ip or '',
         ))
     for it in items:
@@ -192,7 +213,7 @@ def exportar_historico_serial(f: Filtros | None = None):
             'Inhabilitar' if it.inhabilitar else 'Habilitar',
             {'ok': 'Efectiva', 'error': 'Error'}.get(it.estado, 'En proceso'),
             'Masivo',
-            it.job.usuario.email if it.job.usuario else '',
+            _autor(it.job),
             it.job.ip or '',
         ))
 
@@ -260,18 +281,18 @@ def exportar_acciones_usuario(f: Filtros | None = None):
     for j in syncs:
         filas.append((
             j.creado,
-            j.usuario.email if j.usuario else '',
+            _autor(j),
             j.ip or '',
             'Inhabilitar' if j.inhabilitar else 'Habilitar',
             'Individual',
-            j.televisor.mac_address if j.televisor else '—',
-            j.televisor.serial_number if j.televisor else '',
+            _mac_sync(j),
+            _serial_sync(j),
             {'terminado': 'Efectiva', 'error': 'Error'}.get(j.estado, 'En proceso'),
         ))
     # Un lote masivo no es de un solo equipo: solo tiene sentido incluirlo cuando
     # no se filtra por serial ni por estado. La fecha sí se respeta.
     if not f.serial and not f.estado:
-        jobs = BulkSyncJob.objects.select_related('usuario').filter(modo=BulkSyncJob.SYNC)
+        jobs = BulkSyncJob.objects.select_related('usuario', 'api_key').filter(modo=BulkSyncJob.SYNC)
         if f.desde:
             jobs = jobs.filter(creado__date__gte=f.desde)
         if f.hasta:
@@ -279,7 +300,7 @@ def exportar_acciones_usuario(f: Filtros | None = None):
         for job in jobs:
             filas.append((
                 job.creado,
-                job.usuario.email if job.usuario else '',
+                _autor(job),
                 job.ip or '',
                 'Enrolar estado (masivo)',
                 'Masivo',
@@ -307,12 +328,12 @@ def exportar_historial_acciones(f: Filtros | None = None):
     for j in syncs:
         filas.append((
             j.creado,
-            j.televisor.mac_address if j.televisor else '—',
-            j.televisor.serial_number if j.televisor else '',
+            _mac_sync(j),
+            _serial_sync(j),
             'Inhabilitar' if j.inhabilitar else 'Habilitar',
             {'terminado': 'Efectiva', 'error': 'Error'}.get(j.estado, 'En proceso'),
             'Individual',
-            j.usuario.email if j.usuario else '',
+            _autor(j),
             j.ip or '',
             j.error or '',
         ))
@@ -324,7 +345,7 @@ def exportar_historial_acciones(f: Filtros | None = None):
             'Inhabilitar' if it.inhabilitar else 'Habilitar',
             {'ok': 'Efectiva', 'error': 'Error'}.get(it.estado, 'En proceso'),
             'Masivo',
-            it.job.usuario.email if it.job.usuario else '',
+            _autor(it.job),
             it.job.ip or '',
             it.mensaje or '',
         ))
@@ -343,12 +364,12 @@ def exportar_pines_auditoria(f: Filtros | None = None):
         'Auditoría de Pines',
         ['Fecha', 'Usuario', 'IP', 'Dirección MAC', 'Serial', 'Código de Acceso', 'Código Pin'],
     )
-    qs = pines_filtrados(f).select_related('usuario', 'televisor')
+    qs = pines_filtrados(f).select_related('usuario', 'televisor', 'api_key')
 
     for p in qs:
         ws.append([
             _fmt(p.creado),
-            p.usuario.email if p.usuario else '',
+            _autor(p),
             p.ip or '',
             p.mac_address,
             p.televisor.serial_number if p.televisor else '',

@@ -17,27 +17,11 @@ from rest_framework.authentication import BaseAuthentication, get_authorization_
 from rest_framework.exceptions import AuthenticationFailed
 from rest_framework.throttling import SimpleRateThrottle
 
+from common.net import client_ip
+
 from .models import ApiKey
 
 KEYWORD = 'Api-Key'
-
-# Nº de proxies de confianza delante de la app. En Render hay 1: su balanceador
-# añade la IP real del cliente como ÚLTIMA entrada de X-Forwarded-For. Por eso,
-# para un control de seguridad, se lee desde la derecha y NO la primera entrada
-# (que el cliente puede falsificar mandando su propio X-Forwarded-For).
-PROXIES_DE_CONFIANZA = 1
-
-
-def _ip_cliente(request) -> str | None:
-    """IP real del cliente para la lista blanca, a prueba de X-Forwarded-For
-    falsificado, asumiendo `PROXIES_DE_CONFIANZA` saltos de confianza."""
-    xff = request.META.get('HTTP_X_FORWARDED_FOR')
-    if xff:
-        partes = [p.strip() for p in xff.split(',') if p.strip()]
-        if partes:
-            idx = len(partes) - PROXIES_DE_CONFIANZA
-            return partes[idx] if 0 <= idx < len(partes) else partes[0]
-    return request.META.get('REMOTE_ADDR')
 
 
 class ApiKeyUser:
@@ -96,7 +80,9 @@ class ApiKeyAuthentication(BaseAuthentication):
             raise invalida
         if api_key.expirada:
             raise AuthenticationFailed('Esta API key expiró.')
-        if not api_key.ip_permitida(_ip_cliente(request)):
+        # Misma IP que queda en la auditoría: leída desde la derecha de
+        # X-Forwarded-For, que el cliente no puede falsificar.
+        if not api_key.ip_permitida(client_ip(request)):
             # No se dice "IP no permitida" para no confirmar que la clave es
             # válida a quien la usa desde una IP no autorizada.
             raise invalida

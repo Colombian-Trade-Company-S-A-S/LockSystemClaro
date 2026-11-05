@@ -13,10 +13,18 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 
+from auditoria.contexto import Contexto
 from users.models import Role
 from users.services import user_create, user_update
 
 User = get_user_model()
+
+
+def contexto_de(serializer: serializers.Serializer) -> Contexto | None:
+    """Quién hace el cambio, para la bitácora. Las vistas genéricas de DRF
+    pasan la request en el contexto del serializer."""
+    request = serializer.context.get('request')
+    return Contexto.de_request(request) if request is not None else None
 
 
 def campo_nombre(**kwargs) -> serializers.CharField:
@@ -56,7 +64,7 @@ class MeUpdateSerializer(serializers.ModelSerializer):
         fields = ('first_name', 'last_name', 'accent')
 
     def update(self, instance: User, validated_data: dict) -> User:
-        return user_update(user=instance, data=validated_data)
+        return user_update(user=instance, data=validated_data, contexto=contexto_de(self))
 
 
 class ChangePasswordSerializer(serializers.Serializer):
@@ -185,7 +193,7 @@ class AdminUserCreateSerializer(serializers.ModelSerializer):
         return attrs
 
     def create(self, validated_data: dict) -> User:
-        return user_create(**validated_data)
+        return user_create(**validated_data, contexto=contexto_de(self))
 
 
 class AdminUserUpdateSerializer(serializers.ModelSerializer):
@@ -202,4 +210,4 @@ class AdminUserUpdateSerializer(serializers.ModelSerializer):
         fields = ('first_name', 'last_name', 'role', 'is_active')
 
     def update(self, instance: User, validated_data: dict) -> User:
-        return user_update(user=instance, data=validated_data)
+        return user_update(user=instance, data=validated_data, contexto=contexto_de(self))

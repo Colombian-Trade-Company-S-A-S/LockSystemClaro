@@ -19,4 +19,6 @@ urlpatterns = [
 
     # Usuarios y autenticación (register, token, refresh, verify, me)
     path('api/', include('users.api.urls')),
+
+    path('api/auditoria/', include('auditoria.api.urls')),
 ]

@@ -46,15 +46,10 @@ export const apiKeysApi = {
       body: JSON.stringify(data),
     }),
 
-  /** Revoca (desactiva) la clave: deja de funcionar, queda de bitácora. */
+  /** Revoca (desactiva) la clave: deja de funcionar, queda de bitácora. Es la
+   *  única forma de retirarla: el backend no permite borrarlas. */
   revocar: (id: string) =>
     apiFetch<ApiKey>(`/api/integracion/api-keys/${id}/revocar/`, {
       method: 'POST',
-    }),
-
-  /** Elimina el registro de forma definitiva. */
-  remove: (id: string) =>
-    apiFetch<void>(`/api/integracion/api-keys/${id}/`, {
-      method: 'DELETE',
     }),
 }

@@ -27,7 +27,11 @@ class Role(models.TextChoices):
 
     - ADMIN: todas las funcionalidades + gestión de usuarios y parametrizaciones.
     - OPERADOR: gestiones (habilitar/inhabilitar/enrolar/desenrolar), pines y reportes.
-    - CONSULTA: solo lectura — validar estado del dispositivo y consultar pines.
+    - CONSULTA: validar estado (individual o masivo), entregar Códigos Pin y
+      descargar reportes. NO es de solo lectura: entregar un pin deja el
+      televisor Habilitado y lo sincroniza con el portal. No edita televisores
+      ni cambia estados a mano (hallazgo H-08; ver OPERATOR_ACTIONS en
+      televisores/api/views.py).
     """
 
     ADMIN = 'admin', _('Administrador')

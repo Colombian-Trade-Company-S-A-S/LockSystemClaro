@@ -1,5 +1,5 @@
-// Hooks de datos de las API-keys sobre TanStack Query. Crear/revocar/eliminar
-// invalidan la lista para que el cambio se refleje al instante.
+// Hooks de datos de las API-keys sobre TanStack Query. Crear/revocar invalidan
+// la lista para que el cambio se refleje al instante.
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiKeysApi, type ApiKeyCreateInput } from '@/features/settings/api/apiKeys.api'
@@ -28,14 +28,6 @@ export function useRevocarApiKey() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (id: string) => apiKeysApi.revocar(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: apiKeyKeys.list() }),
-  })
-}
-
-export function useEliminarApiKey() {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: (id: string) => apiKeysApi.remove(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: apiKeyKeys.list() }),
   })
 }

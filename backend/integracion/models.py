@@ -35,6 +35,11 @@ def _hash_clave(clave: str) -> str:
     return hashlib.sha256(clave.encode('utf-8')).hexdigest()
 
 
+# Lo que la bitácora guarda de una clave al crearla o modificarla. Nunca la
+# clave ni su hash.
+CAMPOS_API_KEY = ('nombre', 'prefijo', 'activa', 'ips_permitidas', 'expira')
+
+
 class ApiKey(models.Model):
     """Credencial de integración. Un integrador manda
     `Authorization: Api-Key <prefijo>.<secreto>` y con eso opera la API de

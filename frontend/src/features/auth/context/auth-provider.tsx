@@ -67,12 +67,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     applyAccentKey(loggedIn.accent)
   }, [])
 
-  const logout = useCallback(() => {
-    authApi.logout()
+  const salir = useCallback((motivo?: 'inactividad') => {
+    authApi.logout(motivo)
     actividad.limpiar()
     setUser(null)
     setStatus('unauthenticated')
   }, [])
+
+  const logout = useCallback(() => salir(), [salir])
 
   /**
    * Cierre local, sin avisar al backend. Se usa cuando la sesión ya murió allí:
@@ -95,8 +97,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     avisoExpiracion.poner(
       `Cerramos tu sesión tras ${inactividadMin} minutos sin actividad.`,
     )
-    logout()
-  }, [logout, inactividadMin])
+    salir('inactividad')
+  }, [salir, inactividadMin])
 
   useInactividad({
     minutos: inactividadMin,

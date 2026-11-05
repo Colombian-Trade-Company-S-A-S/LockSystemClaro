@@ -14,6 +14,7 @@ import {
   Loader2,
   Pencil,
   RefreshCw,
+  ScrollText,
   ShieldCheck,
   SlidersHorizontal,
   Trash2,
@@ -139,7 +140,7 @@ function RegistroRow({
 export function TelevisorDetailPage() {
   const { id } = useParams()
   const navigate = useNavigate()
-  const { canOperate } = usePermissions()
+  const { canOperate, isAdmin } = usePermissions()
 
   // Lecturas cacheadas (React Query). El televisor lo comparte con la lista y
   // el formulario: volver aquí es instantáneo mientras revalida por detrás.
@@ -352,6 +353,26 @@ export function TelevisorDetailPage() {
                   <Trash2 data-icon="inline-start" /> Eliminar
                 </Button>
               </>
+            )}
+            {isAdmin && (
+              // «Todo lo que pasó con este televisor»: la bitácora filtrada por él.
+              <Button
+                variant="outline"
+                size="sm"
+                render={
+                  <Link
+                    to={`/auditoria?${new URLSearchParams({
+                      objeto_tipo: 'televisor',
+                      objeto_id: String(tv.id),
+                      etiqueta: tv.serial_number
+                        ? `${tv.serial_number} · ${tv.mac_address}`
+                        : tv.mac_address,
+                    })}`}
+                  />
+                }
+              >
+                <ScrollText data-icon="inline-start" /> Auditoría
+              </Button>
             )}
           </div>
         </div>

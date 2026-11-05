@@ -1,0 +1,6 @@
+/trazabilidad/
+
+# Credenciales y logs de depuración (hallazgo H-18): nunca al repositorio.
+# Los logs de la Portal API llevan el accessKey de WhaleTV en claro.
+/password.txt
+*.log

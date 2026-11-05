@@ -12,6 +12,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 from django.contrib.auth import get_user_model
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -95,10 +96,10 @@ def acciones_querysets(f: Filtros | None = None):
     """Querysets de acciones (individuales + masivas) ya filtrados. Reutilizado
     por el resumen y por las exportaciones a nivel de registro."""
     f = f or Filtros()
-    syncs = SyncJob.objects.select_related('televisor', 'usuario')
+    syncs = SyncJob.objects.select_related('televisor', 'usuario', 'api_key')
     items = (
         BulkSyncItem.objects
-        .select_related('televisor', 'job', 'job__usuario')
+        .select_related('televisor', 'job', 'job__usuario', 'job__api_key')
         .filter(job__modo=BulkSyncJob.SYNC)
     )
     if f.desde:
@@ -108,7 +109,11 @@ def acciones_querysets(f: Filtros | None = None):
         syncs = syncs.filter(creado__date__lte=f.hasta)
         items = items.filter(job__creado__date__lte=f.hasta)
     if f.serial:
-        syncs = syncs.filter(televisor__serial_number__icontains=f.serial)
+        # El de un televisor ya borrado vive en la copia del propio job (H-05).
+        syncs = syncs.filter(
+            Q(televisor__serial_number__icontains=f.serial)
+            | Q(televisor__isnull=True, serial_number__icontains=f.serial)
+        )
         items = items.filter(televisor__serial_number__icontains=f.serial)
     if f.estado == 'inhabilitado':
         syncs = syncs.filter(televisor__inhabilitado=True)
@@ -145,8 +150,8 @@ def acciones(f: Filtros | None = None) -> list[dict]:
             'fecha': j.creado,
             'inhabilitar': j.inhabilitar,
             'resultado': _resultado_syncjob(j.estado),
-            'mac': j.televisor.mac_address if j.televisor else '—',
-            'serial': j.televisor.serial_number if j.televisor else '',
+            'mac': j.televisor.mac_address if j.televisor else (j.mac_address or '—'),
+            'serial': j.televisor.serial_number if j.televisor else j.serial_number,
         })
     for it in items:
         filas.append({

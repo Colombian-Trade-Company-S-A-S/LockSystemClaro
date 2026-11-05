@@ -6,14 +6,21 @@ frontend consulta el progreso por polling (igual que whaletv).
 """
 from __future__ import annotations
 
+import logging
 import threading
 
 from django.db import connections
 from django.utils import timezone
 
+from auditoria.catalogo import Resultado
+from auditoria.contexto import Contexto
+from auditoria.services import registrar
+
 from .models import SyncJob, Televisor
 from .portal import open_sync
 from .portal.selenium_sync import sincronizar_estado as sincronizar_con_selenium
+
+logger = logging.getLogger(__name__)
 
 
 def _sincronizar(tv, progreso):
@@ -41,7 +48,37 @@ def _sincronizar(tv, progreso):
     return res
 
 
-def _ejecutar(job_id: int):
+def _operacion(inhabilitar: bool) -> str:
+    return 'Inhabilitar' if inhabilitar else 'Habilitar'
+
+
+def _registrar_fin(job_id: int, contexto: Contexto | None) -> None:
+    """Deja en la bitácora cómo terminó la sincronización, a nombre de quien la
+    pidió. Un fallo aquí no puede tumbar el hilo: se anota en el log y sigue."""
+    try:
+        job = SyncJob.objects.get(pk=job_id)
+        registrar(
+            'sincronizacion_terminada',
+            contexto=contexto,
+            resultado=(
+                Resultado.EXITO if job.estado == SyncJob.TERMINADO else Resultado.FALLO
+            ),
+            objeto_tipo='televisor',
+            objeto_id=job.televisor_id or '',
+            objeto_etiqueta=(
+                f'{job.serial_number} · {job.mac_address}'
+                if job.serial_number
+                else job.mac_address
+            ),
+            operacion=_operacion(job.inhabilitar),
+            job=job.pk,
+            error=job.error or None,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception('No se pudo registrar el fin de la sincronización %s.', job_id)
+
+
+def _ejecutar(job_id: int, contexto: Contexto | None = None):
     try:
         job = SyncJob.objects.get(pk=job_id)
         tv = Televisor.objects.get(pk=job.televisor_id)
@@ -84,20 +121,44 @@ def _ejecutar(job_id: int):
             actualizado=timezone.now(),
         )
     finally:
+        _registrar_fin(job_id, contexto)
         # El hilo tiene su propia conexión a la BD; hay que cerrarla.
         connections.close_all()
 
 
 def lanzar_sync_job(
-    televisor: Televisor, inhabilitar: bool, usuario=None, ip: str | None = None
+    televisor: Televisor,
+    inhabilitar: bool,
+    contexto: Contexto | None = None,
+    origen: str = 'individual',
 ) -> SyncJob:
-    """Crea el SyncJob y lanza el hilo que lo procesa. Devuelve el job."""
+    """Crea el SyncJob y lanza el hilo que lo procesa. Devuelve el job.
+
+    `contexto` lo resuelve la vista (quién y desde dónde) y viaja hasta el hilo:
+    el fin de la sincronización queda a nombre de quien la pidió. `origen` dice
+    por qué se pidió: 'individual' (botón de estado) o 'pin' (un Código Pin
+    habilita el televisor).
+    """
+    ctx = contexto or Contexto.sistema()
     job = SyncJob.objects.create(
         televisor=televisor,
+        # Copia de los identificadores: si el televisor se borra, el historial
+        # sigue diciendo de qué equipo era (H-05).
+        mac_address=televisor.mac_address,
+        serial_number=televisor.serial_number or '',
         inhabilitar=inhabilitar,
-        usuario=usuario if usuario and usuario.is_authenticated else None,
-        ip=ip,
+        usuario_id=ctx.usuario_id,
+        api_key_id=ctx.api_key_id,
+        ip=ctx.ip,
     )
-    hilo = threading.Thread(target=_ejecutar, args=(job.pk,), daemon=True)
+    registrar(
+        'estado_solicitado',
+        contexto=ctx,
+        objeto=televisor,
+        operacion=_operacion(inhabilitar),
+        origen=origen,
+        job=job.pk,
+    )
+    hilo = threading.Thread(target=_ejecutar, args=(job.pk, ctx), daemon=True)
     hilo.start()
     return job

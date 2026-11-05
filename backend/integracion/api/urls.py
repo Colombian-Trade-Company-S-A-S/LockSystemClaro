@@ -3,8 +3,9 @@
 Se monta bajo `/api/integracion/` (ver core/urls.py):
     GET/POST  /api/integracion/api-keys/
     GET       /api/integracion/api-keys/{id}/
-    DELETE    /api/integracion/api-keys/{id}/
     POST      /api/integracion/api-keys/{id}/revocar/
+
+No hay DELETE: una clave se revoca, nunca se borra (ver ApiKeyViewSet).
 """
 from rest_framework.routers import SimpleRouter
 

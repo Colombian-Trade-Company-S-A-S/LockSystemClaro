@@ -100,10 +100,11 @@ class CambioTelevisorSerializer(serializers.ModelSerializer):
         ]
 
     def get_usuario(self, obj) -> str:
-        """Nombre completo, o el correo si no lo tiene, o '—' si se borró."""
-        if not obj.usuario_id:
-            return '—'
-        return obj.usuario.get_full_name() or obj.usuario.email
+        """Nombre completo, o el correo si no lo tiene; 'API key: …' si lo hizo
+        un integrador; '—' si no hay ninguno."""
+        from .registros import nombre_autor
+
+        return nombre_autor(obj)
 
 
 class PinCodeUsadoSerializer(serializers.ModelSerializer):

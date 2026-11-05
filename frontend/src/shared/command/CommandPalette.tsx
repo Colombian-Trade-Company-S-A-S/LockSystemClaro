@@ -17,6 +17,7 @@ import {
   Monitor,
   Plus,
   RefreshCw,
+  ScrollText,
   Search,
   Settings2,
   Upload,
@@ -146,6 +147,14 @@ export function CommandPalette({
         keywords: 'cuentas roles administrar',
         show: isAdmin,
         run: () => go('/usuarios'),
+      },
+      {
+        id: 'nav-auditoria',
+        label: 'Auditoría',
+        icon: ScrollText,
+        keywords: 'bitacora trazabilidad eventos quien accesos log',
+        show: isAdmin,
+        run: () => go('/auditoria'),
       },
       {
         id: 'nav-configuracion',

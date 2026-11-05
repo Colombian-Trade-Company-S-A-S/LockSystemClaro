@@ -258,7 +258,7 @@ def _qs_pincodes(f: dict):
     return (
         qs.order_by('-creado')
         .annotate(
-            usuario_nombre=nombre_usuario('usuario'),
+            usuario_nombre=nombre_usuario('usuario', api_key='api_key'),
             serial=Coalesce('televisor__serial_number', Value('—')),
         )
         .values('creado', 'serial', 'mac_address', 'usuario_nombre', 'passcode', 'pin_code')
@@ -470,10 +470,14 @@ def _respuesta_csv(filename: str, filas) -> HttpResponse:
     # BOM UTF-8 al inicio: sin él, Excel asume Latin-1 y daña las tildes.
     buf.write('﻿')
     w = csv.writer(buf, delimiter=';')
+    filas = list(filas)
     for fila in filas:
         w.writerow(fila)
     resp = HttpResponse(buf.getvalue(), content_type='text/csv; charset=utf-8')
     resp['Content-Disposition'] = f'attachment; filename="{filename}"'
+    # Igual que `_respuesta_xlsx`: sin esta marca la descarga no deja huella en
+    # la bitácora (H-07). Sin contar el encabezado.
+    resp.filas_exportadas = max(len(filas) - 1, 0)
     return resp
 
 

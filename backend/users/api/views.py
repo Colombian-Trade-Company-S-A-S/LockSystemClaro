@@ -7,7 +7,7 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 from rest_framework import filters, generics, permissions, status
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import AuthenticationFailed, ValidationError
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
@@ -19,6 +19,10 @@ from rest_framework_simplejwt.serializers import (
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
+from auditoria.catalogo import Resultado
+from auditoria.contexto import Contexto
+from auditoria.services import registrar
+from common.net import client_ip
 from users.authentication import (
     SESSION_CLAIM,
     TOKEN_VERSION_CLAIM,
@@ -53,14 +57,6 @@ from .serializers import (
 User = get_user_model()
 
 logger = logging.getLogger(__name__)
-
-
-def client_ip(request) -> str | None:
-    """IP del cliente, considerando un posible proxy inverso (X-Forwarded-For)."""
-    xff = request.META.get('HTTP_X_FORWARDED_FOR')
-    if xff:
-        return xff.split(',')[0].strip()
-    return request.META.get('REMOTE_ADDR')
 
 
 # NOTA: no existe una vista de auto-registro público. Las cuentas las crea un
@@ -136,6 +132,56 @@ class LoginView(TokenObtainPairView):
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = 'login'
 
+    @staticmethod
+    def _correo_tecleado(request) -> str:
+        # Esto corre también en `throttled`, ANTES de que el serializer valide
+        # nada: el cuerpo puede ser una lista, y el correo llevar un NUL, que
+        # Postgres rechaza hasta en una consulta.
+        datos = request.data
+        correo = datos.get('email') if isinstance(datos, dict) else ''
+        if not isinstance(correo, str):
+            return ''
+        return correo.replace('\x00', '').strip()[:255]
+
+    @classmethod
+    def _cuenta_tecleada(cls, request):
+        correo = cls._correo_tecleado(request)
+        return User.objects.filter(email__iexact=correo).first() if correo else None
+
+    def _registrar_fallo(
+        self, request, motivo: str, *, user=None, cuenta=None, **detalle
+    ) -> None:
+        """Ingreso fallido en la bitácora (H-02). El motivo va SOLO aquí: la
+        respuesta HTTP sigue siendo la genérica, para no decirle a un extraño si
+        el correo existe. Se guarda el correo tecleado aunque no haya cuenta.
+
+        Con `user`, las credenciales eran buenas (la sesión estaba ocupada): el
+        actor es esa persona. Sin él, es un anónimo que dijo ser ese correo, y
+        la cuenta a la que apuntaba (si existe) queda como objeto.
+        """
+        correo = self._correo_tecleado(request)
+        if user is not None:
+            cuenta = user
+        elif cuenta is None:
+            cuenta = self._cuenta_tecleada(request)
+        registrar(
+            'login_fallido',
+            contexto=(
+                Contexto.de_usuario(user, request)
+                if user is not None
+                else Contexto.anonimo(request, correo)
+            ),
+            resultado=Resultado.FALLO,
+            objeto=cuenta,
+            motivo=motivo,
+            **detalle,
+        )
+
+    def throttled(self, request, wait):
+        # Superar el límite de intentos es la señal más clara de fuerza bruta.
+        self._registrar_fallo(request, 'demasiados intentos (límite de frecuencia)')
+        super().throttled(request, wait)
+
     def post(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         # Credenciales primero: si son incorrectas debe responder 401 aunque la
@@ -145,6 +191,16 @@ class LoginView(TokenObtainPairView):
             serializer.is_valid(raise_exception=True)
         except TokenError as exc:
             raise InvalidToken(str(exc)) from exc
+        except AuthenticationFailed:
+            cuenta = self._cuenta_tecleada(request)
+            if cuenta is None:
+                motivo = 'cuenta inexistente'
+            elif not cuenta.is_active:
+                motivo = 'cuenta inactiva'
+            else:
+                motivo = 'contraseña incorrecta'
+            self._registrar_fallo(request, motivo, cuenta=cuenta)
+            raise
 
         user = serializer.user
         minutos = settings.SESSION_INACTIVITY_MINUTOS
@@ -157,6 +213,13 @@ class LoginView(TokenObtainPairView):
             )
         except SesionEnUso as exc:
             activa = exc.sesion
+            self._registrar_fallo(
+                request,
+                'la cuenta ya tiene una sesión abierta',
+                user=user,
+                dispositivo=activa.descripcion_dispositivo,
+                ip_sesion=activa.ip,
+            )
             return Response(
                 {
                     'detail': (
@@ -176,6 +239,12 @@ class LoginView(TokenObtainPairView):
             )
         except NavegadorEnUso as exc:
             activa = exc.sesion
+            self._registrar_fallo(
+                request,
+                'el navegador ya tiene abierta otra cuenta',
+                user=user,
+                cuenta_ocupante=activa.user.email,
+            )
             # El correo va ofuscado: quien está frente a esta pantalla no es
             # necesariamente el dueño de la sesión abierta, y basta con que
             # reconozca la cuenta para saber a quién pedirle que salga.
@@ -198,6 +267,15 @@ class LoginView(TokenObtainPairView):
                 status=status.HTTP_409_CONFLICT,
             )
 
+        # La fila de sesión activa se sobrescribe y se borra al salir: esto es
+        # lo que queda de que entró (H-02).
+        registrar(
+            'login_exitoso',
+            contexto=Contexto.de_usuario(user, request),
+            objeto=user,
+            sesion=str(sesion.id),
+            dispositivo=sesion.descripcion_dispositivo,
+        )
         return Response(emitir_par_de_tokens(user, sid=sesion.id))
 
 
@@ -252,6 +330,16 @@ class LogoutView(APIView):
     def post(self, request):
         request.user.revoke_tokens()
         sesion_cerrar(request.user)
+        # El navegador avisa si el cierre fue suyo por inactividad
+        # (`motivo: 'inactividad'`); si no, lo pidió la persona.
+        datos = request.data if isinstance(request.data, dict) else {}
+        por_inactividad = datos.get('motivo') == 'inactividad'
+        registrar(
+            'sesion_expirada' if por_inactividad else 'logout',
+            contexto=Contexto.de_request(request),
+            objeto=request.user,
+            detectada_por='navegador' if por_inactividad else None,
+        )
         return Response(status=status.HTTP_205_RESET_CONTENT)
 
 
@@ -271,12 +359,27 @@ class ChangePasswordView(APIView):
         serializer = ChangePasswordSerializer(
             data=request.data, context={'request': request}
         )
-        serializer.is_valid(raise_exception=True)
+        try:
+            serializer.is_valid(raise_exception=True)
+        except ValidationError as exc:
+            # Fallar la contraseña ACTUAL con una sesión abierta es alguien
+            # probando contraseñas desde un equipo desatendido: queda en la
+            # bitácora. Una contraseña nueva débil no, eso es solo un formulario.
+            if isinstance(exc.detail, dict) and 'current_password' in exc.detail:
+                registrar(
+                    'password_cambiado',
+                    contexto=Contexto.de_request(request),
+                    resultado=Resultado.FALLO,
+                    objeto=request.user,
+                    motivo='contraseña actual incorrecta',
+                )
+            raise
 
         user = request.user
         user_set_password(
             user=user, raw_password=serializer.validated_data['new_password']
         )
+        registrar('password_cambiado', contexto=Contexto.de_request(request), objeto=user)
         # Invalida cualquier token anterior (otras sesiones / posibles filtrados).
         user.revoke_tokens()
         # Re-emite para el cliente actual con la nueva versión de token. Se
@@ -309,16 +412,28 @@ class PasswordResetRequestView(APIView):
     def post(self, request):
         serializer = PasswordResetRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        correo = serializer.validated_data['email']
 
+        # La bitácora sí distingue los casos (la respuesta no): una racha de
+        # pedidos para correos sin cuenta es alguien sondeando qué cuentas hay.
+        resultado, motivo, cuenta = Resultado.EXITO, None, None
         try:
-            password_reset_solicitar(
-                email=serializer.validated_data['email'], ip=client_ip(request)
-            )
+            cuenta = password_reset_solicitar(email=correo, ip=client_ip(request))
+            if cuenta is None:
+                resultado, motivo = Resultado.FALLO, 'el correo no tiene una cuenta activa'
         except Exception:
             # Un fallo de envío (Gmail caído, token revocado) no debe distinguirse
             # de un correo inexistente: se registra para operaciones y al cliente
             # se le responde igual.
             logger.exception('Fallo al enviar el correo de recuperación.')
+            resultado, motivo = Resultado.FALLO, 'no se pudo enviar el correo'
+        registrar(
+            'password_reset_solicitado',
+            contexto=Contexto.anonimo(request, correo),
+            resultado=resultado,
+            objeto=cuenta,
+            motivo=motivo,
+        )
 
         return Response(
             {
@@ -391,6 +506,13 @@ class PasswordResetConfirmView(APIView):
         # reglas de contraseña contra el usuario dueño del enlace.
         registro = password_reset_buscar(str(request.data.get('token', '')))
         if registro is None or not registro.es_valido:
+            registrar(
+                'password_reset_completado',
+                contexto=Contexto.anonimo(request),
+                resultado=Resultado.FALLO,
+                objeto=registro.user if registro is not None else None,
+                motivo='enlace inválido, usado o vencido',
+            )
             raise ValidationError({
                 'token': [
                     'El enlace no es válido o ya venció. Solicita uno nuevo.'
@@ -403,7 +525,7 @@ class PasswordResetConfirmView(APIView):
         serializer.is_valid(raise_exception=True)
 
         try:
-            password_reset_confirmar(
+            user = password_reset_confirmar(
                 registro=registro,
                 raw_password=serializer.validated_data['new_password'],
                 ip=client_ip(request),
@@ -412,6 +534,13 @@ class PasswordResetConfirmView(APIView):
             # Carrera: el enlace se consumió entre la comprobación y el commit.
             raise ValidationError({'token': [str(exc)]}) from exc
 
+        # Actúa como el titular de la cuenta: tener el enlace prueba acceso a
+        # su correo.
+        registrar(
+            'password_reset_completado',
+            contexto=Contexto.de_usuario(user, request),
+            objeto=user,
+        )
         return Response({
             'detail': 'Tu contraseña fue actualizada. Ya puedes iniciar sesión.'
         })
@@ -515,6 +644,13 @@ class AdminCerrarSesionView(APIView):
         # hasta vencer.
         objetivo.revoke_tokens()
 
+        registrar(
+            'sesion_cerrada_por_admin',
+            contexto=Contexto.de_request(request),
+            objeto=objetivo,
+            dispositivo=dispositivo,
+            ip_sesion=sesion.ip,
+        )
         logger.info(
             'Sesión de %s cerrada por %s (admin).', objetivo.email, request.user.email
         )

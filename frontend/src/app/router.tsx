@@ -28,6 +28,7 @@ import { PincodesPage } from '@/features/pincodes/pages/PincodesPage'
 import { UsuariosPage } from '@/features/usuarios/pages/UsuariosPage'
 import { UsuarioFormPage } from '@/features/usuarios/pages/UsuarioFormPage'
 import { SettingsPage } from '@/features/settings/pages/SettingsPage'
+import { AuditoriaPage } from '@/features/auditoria/pages/AuditoriaPage'
 import { DashboardLayout } from '@/shared/layout/DashboardLayout'
 
 export const router = createBrowserRouter([
@@ -165,6 +166,13 @@ export const router = createBrowserRouter([
                 path: '/usuarios/:id/editar',
                 element: <UsuarioFormPage />,
                 handle: { breadcrumb: 'Usuarios / Editar' },
+              },
+              {
+                // Bitácora central (plan de trazabilidad). Solo Administrador:
+                // decisión D-4 pendiente; el backend aplica la misma regla.
+                path: '/auditoria',
+                element: <AuditoriaPage />,
+                handle: { breadcrumb: 'Auditoría' },
               },
             ],
           },

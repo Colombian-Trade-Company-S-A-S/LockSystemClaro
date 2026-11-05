@@ -1,9 +1,14 @@
+from django.db import transaction
+from django.utils import timezone
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 
-from televisores.cambios import registrar_cambios, snapshot
+from auditoria.catalogo import ActorTipo, Resultado
+from auditoria.contexto import Contexto
+from auditoria.services import describir, diferencias, registrar
+from televisores.cambios import foto_completa, registrar_cambios, snapshot
 from televisores.models import Televisor
 from users.permissions import CanOperate
 from televisores.portal.client import (
@@ -20,14 +25,6 @@ from televisores.portal.scraper import (
 from .imports import importar_televisores
 
 
-def client_ip(request) -> str | None:
-    """IP del cliente, considerando un posible proxy inverso (X-Forwarded-For)."""
-    xff = request.META.get('HTTP_X_FORWARDED_FOR')
-    if xff:
-        return xff.split(',')[0].strip()
-    return request.META.get('REMOTE_ADDR')
-
-
 def _eui64_o_vacio(tv) -> str:
     """EUI-64 del televisor, o '' si la MAC no permite derivarlo.
 
@@ -40,17 +37,11 @@ def _eui64_o_vacio(tv) -> str:
         return ''
 
 
-def usuario_para_auditoria(request):
-    """Usuario real para guardar como FK de auditoría, o None.
+def _origen(contexto: Contexto) -> str:
+    """Por dónde entró la acción: el panel o la API de integración."""
+    return 'api' if contexto.actor_tipo == ActorTipo.API_KEY else 'panel'
 
-    Las peticiones de la API de integración traen un usuario sintético de
-    API-key (pk=None) que no es una fila de la base: no puede guardarse como
-    llave foránea. En ese caso se audita con usuario vacío + la IP. Para el panel
-    (JWT) devuelve el usuario autenticado normal."""
-    user = getattr(request, 'user', None)
-    if user is None or not user.is_authenticated or getattr(user, 'pk', None) is None:
-        return None
-    return user
+
 from .serializers import (
     BulkSyncJobSerializer,
     PinCodeUsadoSerializer,
@@ -95,6 +86,20 @@ class TelevisorViewSet(viewsets.ModelViewSet):
             return [permissions.IsAuthenticated(), CanOperate()]
         return [permissions.IsAuthenticated()]
 
+    def perform_create(self, serializer):
+        """Alta individual (panel o API), con su evento en la misma transacción
+        (hallazgo H-04): si el alta se revierte, la bitácora no la afirma."""
+        contexto = Contexto.de_request(self.request)
+        with transaction.atomic():
+            televisor = serializer.save()
+            registrar(
+                'televisor_creado',
+                contexto=contexto,
+                objeto=televisor,
+                despues=foto_completa(televisor),
+                origen=_origen(contexto),
+            )
+
     def update(self, request, *args, **kwargs):
         """Edición individual, dejando constancia en el historial de cambios.
 
@@ -102,17 +107,55 @@ class TelevisorViewSet(viewsets.ModelViewSet):
         saber qué había. Se registra fuera del serializer para que la auditoría
         no dependa de por dónde entren los datos.
         """
-        antes = snapshot(self.get_object())
-        respuesta = super().update(request, *args, **kwargs)
+        contexto = Contexto.de_request(request)
+        with transaction.atomic():
+            previo = self.get_object()
+            antes = snapshot(previo)
+            foto_antes = foto_completa(previo)
+            respuesta = super().update(request, *args, **kwargs)
 
-        televisor = self.get_object()
-        registrar_cambios(
-            televisor=televisor,
-            antes=antes,
-            usuario=request.user,
-            ip=client_ip(request),
-        )
+            televisor = self.get_object()
+            registrar_cambios(televisor=televisor, antes=antes, contexto=contexto)
+            # Guardar el formulario sin tocar nada no es un evento.
+            antes_dif, despues_dif = diferencias(foto_antes, foto_completa(televisor))
+            if despues_dif:
+                registrar(
+                    'televisor_editado',
+                    contexto=contexto,
+                    objeto=televisor,
+                    antes=antes_dif,
+                    despues=despues_dif,
+                    origen=_origen(contexto),
+                )
         return respuesta
+
+    def perform_destroy(self, instance):
+        """Baja de un televisor (hallazgo H-04).
+
+        Se fotografía el estado completo ANTES de borrar: es la única forma de
+        saber después qué se perdió. Su historial de sincronizaciones, pines y
+        cambios ya no se borra con él (H-05); el evento dice cuánto quedó.
+        """
+        contexto = Contexto.de_request(self.request)
+        tipo, objeto_id, etiqueta = describir(instance)
+        with transaction.atomic():
+            antes = foto_completa(instance)
+            historial = {
+                'sincronizaciones': instance.sync_jobs.count(),
+                'pines': instance.pincodes_usados.count(),
+                'cambios': instance.cambios.count(),
+            }
+            instance.delete()
+            registrar(
+                'televisor_eliminado',
+                contexto=contexto,
+                objeto_tipo=tipo,
+                objeto_id=objeto_id,
+                objeto_etiqueta=etiqueta,
+                antes=antes,
+                historial_conservado=historial,
+                origen=_origen(contexto),
+            )
 
     @action(
         detail=False,
@@ -130,8 +173,7 @@ class TelevisorViewSet(viewsets.ModelViewSet):
         resultado = importar_televisores(
             archivo.name,
             archivo.read(),
-            usuario=request.user,
-            ip=client_ip(request),
+            contexto=Contexto.de_request(request),
         )
         return Response(resultado, status=status.HTTP_200_OK)
 
@@ -212,7 +254,7 @@ class TelevisorViewSet(viewsets.ModelViewSet):
         """Lanza una validación masiva (dry-run) de todos los televisores."""
         from televisores.bulk_sync import lanzar_validacion_masiva
 
-        job = lanzar_validacion_masiva()
+        job = lanzar_validacion_masiva(contexto=Contexto.de_request(request))
         if job is None:
             return Response(
                 {'detail': 'No hay televisores para validar.'},
@@ -237,25 +279,34 @@ class TelevisorViewSet(viewsets.ModelViewSet):
         from televisores.models import BulkSyncJob, SyncJob
         from televisores.watchdog import esta_vivo, marcar_huerfanos
 
+        from .registros import nombre_autor
+
         marcar_huerfanos()
+
+        def autor(job) -> str:
+            return nombre_autor(job) if job.usuario_id or job.api_key_id else ''
 
         activos = [SyncJob.PENDIENTE, SyncJob.CORRIENDO]
         individuales = [
             {
                 'job': j.pk,
                 'televisor_id': j.televisor_id,
-                'mac_address': j.televisor.mac_address,
-                'serial_number': j.televisor.serial_number,
+                # El televisor puede haberse borrado con el job en marcha: la
+                # fila guarda su propia copia de los identificadores (H-05).
+                'mac_address': j.televisor.mac_address if j.televisor else j.mac_address,
+                'serial_number': (
+                    j.televisor.serial_number if j.televisor else j.serial_number
+                ),
                 'inhabilitar': j.inhabilitar,
                 'estado': j.estado,
                 'porcentaje': j.porcentaje,
                 'creado': j.creado,
                 'actualizado': j.actualizado,
                 'vivo': esta_vivo(j),
-                'usuario': j.usuario.get_full_name() if j.usuario else '',
+                'usuario': autor(j),
             }
             for j in SyncJob.objects.filter(estado__in=activos)
-            .select_related('televisor', 'usuario')
+            .select_related('televisor', 'usuario', 'api_key')
             .order_by('-creado')[:50]
         ]
 
@@ -273,12 +324,12 @@ class TelevisorViewSet(viewsets.ModelViewSet):
                 'creado': b.creado,
                 'actualizado': b.actualizado,
                 'vivo': esta_vivo(b),
-                'usuario': b.usuario.get_full_name() if b.usuario else '',
+                'usuario': autor(b),
             }
             for b in BulkSyncJob.objects.filter(
                 estado__in=[BulkSyncJob.PENDIENTE, BulkSyncJob.CORRIENDO]
             )
-            .select_related('usuario')
+            .select_related('usuario', 'api_key')
             .order_by('-creado')[:50]
         ]
 
@@ -311,7 +362,7 @@ class TelevisorViewSet(viewsets.ModelViewSet):
         url_path=r'validar-masivo/(?P<job_id>[0-9]+)/cancelar',
     )
     def validar_masivo_cancelar(self, request, job_id=None):
-        return self._cancelar_bulk_job(job_id)
+        return self._cancelar_bulk_job(request, job_id)
 
     @action(
         detail=False,
@@ -347,6 +398,14 @@ class TelevisorViewSet(viewsets.ModelViewSet):
             return Response({'detail': str(e)}, status=status.HTTP_404_NOT_FOUND)
         except PortalError as e:
             return Response({'detail': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+        # Esta respuesta lleva Códigos Pin en claro: es salida de información
+        # sensible aunque no sea un Excel. Se registra cuántos, nunca cuáles.
+        registrar(
+            'pines_consultados',
+            contexto=Contexto.de_request(request),
+            objeto=tv,
+            grupos=len(grupos),
+        )
         return Response(
             {'eui64': _eui64_o_vacio(tv), 'grupos': grupos, 'modo': modo_portal()}
         )
@@ -372,6 +431,19 @@ class TelevisorViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        contexto = Contexto.de_request(request)
+
+        def fallo(motivo: str):
+            # Un Código de Acceso que no da pin también queda: una racha de
+            # estos es alguien probando códigos al azar.
+            registrar(
+                'pin_entregado',
+                contexto=contexto,
+                resultado=Resultado.FALLO,
+                objeto=tv,
+                motivo=motivo,
+            )
+
         # El proveedor resuelve el passcode y ya lo deja marcado como usado:
         # por API con `marcar_pincodes_usados`, por portal al generarlo.
         try:
@@ -379,6 +451,7 @@ class TelevisorViewSet(viewsets.ModelViewSet):
         except ValueError:
             return self._respuesta_mac_invalida()
         except PortalPasscodeInvalido:
+            fallo('Código de Acceso sin Código Pin disponible')
             return Response(
                 {'detail': 'No hay un Código Pin disponible para ese Código de Acceso.'},
                 status=status.HTTP_404_NOT_FOUND,
@@ -386,18 +459,21 @@ class TelevisorViewSet(viewsets.ModelViewSet):
         except PortalDispositivoNoExiste as e:
             return Response({'detail': str(e)}, status=status.HTTP_404_NOT_FOUND)
         except PortalError as e:
+            fallo(f'El portal falló: {e}'[:200])
             return Response({'detail': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
 
-        usuario = usuario_para_auditoria(request)
-        ip = client_ip(request)
         registro = PinCodeUsado.objects.create(
             televisor=tv,
             mac_address=tv.mac_address,
             passcode=passcode,
             pin_code=pin_code,
-            usuario=usuario,
-            ip=ip,
+            usuario_id=contexto.usuario_id,
+            api_key_id=contexto.api_key_id,
+            ip=contexto.ip,
         )
+        # Sin el pin ni el código de acceso: la bitácora remite a la fila de
+        # Códigos Pin, que es la que los guarda (su enmascarado es el H-14).
+        registrar('pin_entregado', contexto=contexto, objeto=tv, registro=registro.pk)
 
         # Se sincroniza aunque la consola ya dijera Habilitado: si el portal
         # quedó bloqueado (una sync anterior que falló), el televisor se
@@ -405,7 +481,7 @@ class TelevisorViewSet(viewsets.ModelViewSet):
         # Sincronizaciones como una habilitación más, con usuario e IP.
         tv.inhabilitado = False
         tv.save(update_fields=['inhabilitado'])
-        job = lanzar_sync_job(tv, False, usuario=usuario, ip=ip)
+        job = lanzar_sync_job(tv, False, contexto=contexto, origen='pin')
 
         return Response({
             'passcode': passcode,
@@ -431,9 +507,7 @@ class TelevisorViewSet(viewsets.ModelViewSet):
         tv.inhabilitado = inhabilitar
         tv.save(update_fields=['inhabilitado'])
 
-        job = lanzar_sync_job(
-            tv, inhabilitar, usuario=usuario_para_auditoria(request), ip=client_ip(request)
-        )
+        job = lanzar_sync_job(tv, inhabilitar, contexto=Contexto.de_request(request))
         return Response(
             {
                 'job': job.pk,
@@ -522,8 +596,6 @@ class TelevisorViewSet(viewsets.ModelViewSet):
             )
 
         # Sin latido: el hilo murió. Se cierra para desbloquear al que espera.
-        from django.utils import timezone
-
         ahora = timezone.now()
         SyncJob.objects.filter(pk=job.pk).update(
             estado=SyncJob.ERROR,
@@ -533,6 +605,13 @@ class TelevisorViewSet(viewsets.ModelViewSet):
             actualizado=ahora,
         )
         job.refresh_from_db()
+        registrar(
+            'sincronizacion_descartada',
+            contexto=Contexto.de_request(request),
+            objeto=tv,
+            job=job.pk,
+            operacion='Inhabilitar' if job.inhabilitar else 'Habilitar',
+        )
         return Response({
             'job': job.pk,
             'estado': job.estado,
@@ -634,9 +713,7 @@ class TelevisorViewSet(viewsets.ModelViewSet):
         cambiados = resumen['cambiados']
 
         job = (
-            lanzar_bulk_job(
-                cambiados, resumen, usuario=request.user, ip=client_ip(request)
-            )
+            lanzar_bulk_job(cambiados, resumen, contexto=Contexto.de_request(request))
             if cambiados
             else None
         )
@@ -707,7 +784,7 @@ class TelevisorViewSet(viewsets.ModelViewSet):
         url_path=r'enrolar-estado/(?P<job_id>[0-9]+)/cancelar',
     )
     def enrolar_estado_cancelar(self, request, job_id=None):
-        return self._cancelar_bulk_job(job_id)
+        return self._cancelar_bulk_job(request, job_id)
 
     @action(
         detail=False,
@@ -729,12 +806,16 @@ class TelevisorViewSet(viewsets.ModelViewSet):
             )
         return exportar_bulk_job(job)
 
-    def _cancelar_bulk_job(self, job_id):
+    def _cancelar_bulk_job(self, request, job_id):
         """Marca un BulkSyncJob (sync o validación) para que el hilo en
         segundo plano lo detenga en el próximo televisor que revise.
 
         Si el lote ya no late, no hay hilo que atienda la petición: en ese caso
         se cierra directamente, que si no quedaría 'corriendo' para siempre.
+
+        La cancelación queda en la bitácora con quién la ordenó y en qué punto
+        estaba el lote (hallazgo H-10): cancelar puede dejar bloqueados a
+        clientes que debían liberarse.
         """
         from televisores.models import BulkSyncJob
         from televisores.watchdog import esta_vivo, marcar_huerfanos
@@ -750,10 +831,23 @@ class TelevisorViewSet(viewsets.ModelViewSet):
         if not job.finalizado:
             if esta_vivo(job):
                 # Hay hilo: cancelación cooperativa (se detiene en el siguiente).
+                forma = 'solicitada'
                 job.cancelar_solicitado = True
                 job.save(update_fields=['cancelar_solicitado'])
             else:
+                forma = 'inmediata'
                 job.estado = BulkSyncJob.CANCELADO
                 job.terminado_en = timezone.now()
                 job.save(update_fields=['estado', 'terminado_en', 'actualizado'])
+            registrar(
+                'lote_cancelado',
+                contexto=Contexto.de_request(request),
+                objeto=job,
+                forma=forma,
+                estado=job.estado,
+                total=job.total,
+                procesados=job.procesados,
+                ok=job.ok_count,
+                errores=job.error_count,
+            )
         return Response(BulkSyncJobSerializer(job).data)
